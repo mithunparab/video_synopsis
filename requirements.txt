@@ -1,0 +1,13 @@
+streamlit
+numpy
+opencv-python
+Pillow
+albumentations
+torch
+tqdm
+matplotlib
+scikit-image
+people-segmentation
+iglovikov-helper-functions
+filterpy
+opencv-python-headless
