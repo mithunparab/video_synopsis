@@ -20,14 +20,12 @@ def plot_tubes(ax, tube_data, tube_starts, areas, title):
         if tube_starts is not None:
             z = z - np.min(z) + tube_starts[i]
         area_size = (areas[tube_id] / np.max(list(areas.values())) * 100)
-        ax.scatter(x, y, z, s=area_size, color=colors[i % len(colors)], label=f'Tube {tube_id}')
+        ax.scatter(x, y, z, s=area_size, c=[colors[i % len(colors)]], label=f'Tube {tube_id}')
     ax.set_title(title)
     ax.legend(loc="lower left")
     ax.set_xlabel('X Coordinate')
     ax.set_ylabel('Y Coordinate')
     ax.set_zlabel('Time (t)')
-    ax.legend()
-    
 
 
 def parse_contours(contour_str):
