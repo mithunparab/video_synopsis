@@ -103,13 +103,19 @@ def load_tubes(files_pattern):
         for is_new_tube, group in df_sorted.groupby(split_points.cumsum()):
             tube_data[tube_id_counter] = group[['centroid_x', 'centroid_y', 'time']].values
             areas[tube_id_counter] = group['area'].mean()
-            boxes[tube_id_counter] = (group['x1'].min(), group['y1'].min(), group['x2'].max(), group['y2'].max())
+            
+            # Calculate bounding box based on centroids' min and max
+            min_cx = group['centroid_x'].min()
+            min_cy = group['centroid_y'].min()
+            max_cx = group['centroid_x'].max()
+            max_cy = group['centroid_y'].max()
+            boxes[tube_id_counter] = (min_cx, min_cy, max_cx, max_cy)
+            
             original_tube_map[tube_id_counter] = original_tube_id
             full_dataframes[tube_id_counter] = group
             tube_id_counter += 1
 
     return tube_data, areas, boxes, original_tube_map, full_dataframes
-
 
 def get_time_bounds(tube, start_time):
     """Calculate the start and end time of a tube."""
