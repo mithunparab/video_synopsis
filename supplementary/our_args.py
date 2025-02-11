@@ -40,6 +40,12 @@ parser.add_argument(
     default=15
 )
 parser.add_argument(
+    "-bsz", "--batch_size", 
+    help="Batch size for frame wise inference (default: 8)", 
+    type=int, 
+    default=8
+)
+parser.add_argument(
     "--files_csv_dir", 
     help="Directory to save tube CSV files (default: '*/*.csv')", 
     type=str, 
@@ -75,6 +81,7 @@ parser.add_argument(
     type=bool, 
     default=True
 )
+
 parser.add_argument(
     "--epochs", 
     help="Number of epochs for energy optimization (default: 2000)", 

@@ -4,8 +4,8 @@ import numpy as np
 import glob
 from PIL import Image
 from tqdm import tqdm
+import pandas as pd
 from collections import defaultdict, deque
-
 
 def blend_roi_on_background(background, roi, roi_mask, x1, x2, y1, y2):
     # Clamping ROI coordinates to ensure they are within the bounds of the background image
@@ -167,45 +167,68 @@ def resize_tube(image, mask, x1, x2, y1, y2, min_size=50, reduction=2):
 
 #     return composite_image, composite_mask
 
-def create_composite_image(tube_queues, bg_shape):
+def create_composite_image(tube_queues, bg_shape, log):
     composite_image = np.zeros(bg_shape, dtype=np.uint8)
     composite_mask = np.zeros(bg_shape[:2], dtype=bool)
     processed = set()
-
-    # Create a list of tubes and their frames for processing
     active_tubes = [(Tube, frames[0]) for Tube, frames in tube_queues.items() if frames]
-
-    # Using a more efficient structure to track overlaps
     overlap_checked = set()
 
     for i, (Tube, frame) in enumerate(active_tubes):
         x1, x2, y1, y2, image, mask = frame[1:]
-        key = frozenset({Tube})
+        original_image = image.copy()
+        original_mask = mask.copy()
 
+        # Process overlaps and resize
         for j, (other_Tube, other_frame) in enumerate(active_tubes):
-            if i != j:
-                other_key = frozenset({Tube, other_Tube})
-                if other_key in overlap_checked:
-                    continue
-
-                overlap_checked.add(other_key)
-                other_x1, other_x2, other_y1, other_y2, other_image, other_mask = other_frame[1:]
-
-                if check_overlap(x1, x2, y1, y2, other_x1, other_x2, other_y1, other_y2):
+            if i != j and frozenset({Tube, other_Tube}) not in overlap_checked:
+                overlap_checked.add(frozenset({Tube, other_Tube}))
+                ox1, ox2, oy1, oy2, other_image, other_mask = other_frame[1:]
+                
+                if check_overlap(x1, x2, y1, y2, ox1, ox2, oy1, oy2):
                     image, mask, x1, x2, y1, y2 = resize_tube(image, mask, x1, x2, y1, y2)
-                    other_image, other_mask, other_x1, other_x2, other_y1, other_y2 = resize_tube(other_image, other_mask, other_x1, other_x2, other_y1, other_y2)
+                    other_image, other_mask, ox1, ox2, oy1, oy2 = resize_tube(other_image, other_mask, ox1, ox2, oy1, oy2)
 
         if Tube not in processed:
-            if mask.ndim == 2:
-                mask = mask[:, :, None]
-            valid_region = (slice(y1, y2), slice(x1, x2))
-            composite_image[valid_region] = np.where(mask, image, composite_image[valid_region])
-            composite_mask[valid_region] = np.logical_or(composite_mask[valid_region], mask[..., 0].astype(bool))
+            # Final safety checks
+            x1, x2 = sorted((max(0, x1), min(bg_shape[1], x2)))
+            y1, y2 = sorted((max(0, y1), min(bg_shape[0], y2)))
+            
+            # Calculate actual region dimensions
+            region_height = y2 - y1
+            region_width = x2 - x1
+            
+            # Handle empty regions
+            if region_height <= 0 or region_width <= 0:
+                tube_queues[Tube].popleft()
+                continue
+
+            # Ensure image dimensions match region
+            if image.shape[:2] != (region_height, region_width):
+                image = cv2.resize(image, (region_width, region_height))
+                mask = cv2.resize(mask.astype(np.uint8), (region_width, region_height))
+
+            # Dimension alignment
+            if image.ndim == 2:
+                image = np.repeat(image[:, :, np.newaxis], 3, axis=2)
+            if mask.ndim == 3 and mask.shape[2] == 1:
+                mask = mask.squeeze()
+            
+            # Final validation
+            try:
+
+                composite_image[y1:y2, x1:x2] = np.where(mask[..., None], image, composite_image[y1:y2, x1:x2])
+                composite_mask[y1:y2, x1:x2] |= mask.astype(bool)
+            except ValueError as e:
+                # Fallback to original dimensions
+                log.warning(f"[Error] {e}")
+                composite_image[y1:y2, x1:x2] = np.where(original_mask[..., None], original_image, composite_image[y1:y2, x1:x2])
+                composite_mask[y1:y2, x1:x2] |= original_mask.astype(bool)
+
             processed.add(Tube)
             tube_queues[Tube].popleft()
 
     return composite_image, composite_mask
-
 
 def blend_on_background(background, composite_image, composite_mask):
     return np.where(composite_mask[:, :, None], composite_image, background)
@@ -231,19 +254,50 @@ def load_tube_data(dir2, final):
                     tube_queues[Tube].append((n, *coords, image, mask))
     return tube_queues
 
+def convert_directory_csv_to_txt(input_dir:str, output_dir:str):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    for filename in os.listdir(input_dir):
+        if filename.endswith('.csv'):
+            csv_file_path = os.path.join(input_dir, filename)
+            txt_filename = filename.replace('.csv', '.txt')
+            txt_file_path = os.path.join(output_dir, txt_filename)
+            csv_to_txt(csv_file_path, txt_file_path)
+
+def csv_to_txt(csv_file_path:str, txt_file_path:str):
+    df = pd.read_csv(csv_file_path)
+    tube_id = csv_file_path.split('/')[-1].split('.')[0].split('_')[-1].zfill(4)
+    df['T'] = tube_id
+    df['time'] = df['time']
+    
+    output_columns = ['T', 'n', 'x1', 'x2', 'y1', 'y2', 'time']
+    if 'n' not in df.columns:
+        df['n'] = range(1, len(df) + 1)
+    
+    formatted_data = df[output_columns].apply(
+        lambda x: f"{x['T']}, {x['n']}, {x['x1']}, {x['x2']}, {x['y1']}, {x['y2']}, {x['time']:.2f},",
+        axis=1
+    )
+    
+    with open(txt_file_path, 'w') as f:
+        for line in formatted_data:
+            f.write(line + '\n')
+
 def Tube(args: dict, 
          video: cv2.VideoWriter,  
          bgimg:np.array=None, 
          final:str='../masks', 
-         dir2:str="../optimized_tubes/*.txt"):
+         dir2:str="../optimized_tubes/*.txt",
+         log=None):
     tube_queues = load_tube_data(dir2, final)
     if bgimg is None:
-        bgimg = np.asarray(Image.open('../bg/background_img.png'))
+        bgimg = np.asarray(Image.open(args['bg_path']))
         bgimg = cv2.cvtColor(bgimg, cv2.COLOR_RGB2BGR)
 
     max_frames = max(len(frames) for frames in tube_queues.values())
     for _ in tqdm(range(max_frames), desc=u'⏳ Processing frames'):
-        composite_image, composite_mask = create_composite_image(tube_queues, bgimg.shape)
+        composite_image, composite_mask = create_composite_image(tube_queues, bgimg.shape, log)
         current_bg = blend_on_background(np.copy(bgimg), composite_image, composite_mask)
         video.write(current_bg)
 

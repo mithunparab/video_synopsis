@@ -58,30 +58,29 @@ python main.py -h
 Process video and perform energy optimization for video synopsis.
 
 options:
-  -h, --help            show this help message and exit
+  -h, --help                      Show this help message and exit
   -b BUFF_SIZE, --buff_size BUFF_SIZE
-                        Buffer size for capturing footage (default: 32 frames)
+                                   Buffer size for capturing footage (default: 32 frames)
   -v VIDEO, --video VIDEO
-                        Path to the input video file (default: '../src/all_rush_video.mp4')
+                                   Path to the input video file (default: '../src/all_rush_video.mp4')
   -inmod INPUT_MODEL, --input_model INPUT_MODEL
-                        Path to the input model (default: 'Unet_2020-07-20')
-  -e EXT, --ext EXT     File extension for extracted objects (default: '.png')
-  -cv DVALUE, --dvalue DVALUE
-                        Compression value (0-9; default: 9)
-  -f FRAME, --frame FRAME
-                        Frames per second (FPS) for video processing (default: 15)
-  --files_csv_dir FILES_CSV_DIR
-                        Directory to save tube CSV files (default: '*/*.csv')
+                                   Path to the input model (default: 'Unet_2020-07-20')
+  -e EXT, --ext EXT               File extension for extracted objects (default: '.png')
+  -cv DVALUE, --dvalue DVALUE     Compression value (0-9; default: 9)
+  -f FRAME, --frame FRAME         Frames per second (FPS) for video processing (default: 15)
+  -bsz BATCH_SIZE, --batch_size BATCH_SIZE
+                                   Batch size for frame-wise inference (default: 8)
+  --files_csv_dir FILES_CSV_DIR   Directory to save tube CSV files (default: '*/*.csv')
   --optimized_tubes_dir OPTIMIZED_TUBES_DIR
-                        Directory for optimized tubes (default: '../optimized_tubes')
-  --output OUTPUT       Output directory for processed data (default: 'output')
-  --masks MASKS         Directory containing masks (default: '../masks')
+                                   Directory for optimized tubes (default: '../optimized_tubes')
+  --output OUTPUT                 Output directory for processed data (default: 'output')
+  --masks MASKS                   Directory containing masks (default: '../masks')
   --synopsis_frames SYNOPSIS_FRAMES
-                        Directory for synopsis frames (default: '../synopsis_frames')
+                                   Directory for synopsis frames (default: '../synopsis_frames')
   --energy_optimization ENERGY_OPTIMIZATION
-                        Enable or disable energy optimization (default: True)
-  --epochs EPOCHS       Number of epochs for energy optimization (default: 2000)
-  --bg_path BG_PATH     Path to the extracted background image (default: '../bg/background_img.png')
+                                   Enable or disable energy optimization (default: True)
+  --epochs EPOCHS                 Number of epochs for energy optimization (default: 2000)
+  --bg_path BG_PATH               Path to the extracted background image (default: '../bg/background_img.png')
 ```
 
 ## Result
