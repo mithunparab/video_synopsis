@@ -205,7 +205,7 @@ def main(args: dict,
     image_count = generate_tubes_online(args, cap, video_length)
     
     if energy_opt:
-        optimize_tubes(args, video, bgimg, final, video_length, epochs, size)
+        optimize_tubes(args, video, bgimg, final, video_length, epochs)
     else:
         Tube(args, video, bgimg=bgimg, final=final, dir2="*/*.txt")
     
