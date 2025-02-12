@@ -17,20 +17,24 @@
 
 ---
 
+### New Updates
+
+- Added support for multi gpu and batch processing for faster inference.
+- Added configuration management 
 ## Requirements
 
-* Python 3.8+
-* Pytorch
-* streamlit
-* albumentations
-* people-segmentation
-* iglovikov-helper-functions
-* filterpy
-* gdown
-* opencv-python
-* scipy
-* numpy
-* Pillow
+- Python 3.8+
+- Pytorch
+- streamlit
+- albumentations
+- people-segmentation
+- iglovikov-helper-functions
+- filterpy
+- gdown
+- opencv-python
+- scipy
+- numpy
+- Pillow
 
 ```pip install -r requirements.txt```
 
@@ -48,7 +52,7 @@ streamlit run app.py
 python main.py
 ```
 
-* For more information regarding arguments: <br>
+- For more information regarding arguments: <br>
 
 ```bash
 python main.py -h

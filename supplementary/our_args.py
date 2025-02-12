@@ -1,4 +1,20 @@
 import argparse
+import yaml
+import os
+
+CONFIG_PATH = "config.yaml"
+
+def load_yaml_config(config_path):
+    """Load configuration from a YAML file."""
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            return yaml.safe_load(f) or {}  # Ensure it returns a dict, even if file is empty
+    return {}
+
+def save_yaml_config(config, config_path):
+    """Save configuration to a YAML file."""
+    with open(config_path, "w") as f:
+        yaml.dump(config, f, default_flow_style=False)
 
 # Create an ArgumentParser instance
 parser = argparse.ArgumentParser(description="Process video and perform energy optimization for video synopsis.")

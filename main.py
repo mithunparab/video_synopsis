@@ -1,66 +1,94 @@
-from sort import Sort
-from tube_util import Tube, Tube_mod, convert_directory_csv_to_txt
-from supplementary.our_args import args
-from energy import optimize_tube
-from utils import pad_image, pad_to_max_shape
-from people_segmentation.pre_trained_models import create_model
-import albumentations as albu
-from iglovikov_helper_functions.dl.pytorch.utils import tensor_from_rgb_image
-import cv2
-import numpy as np
 import os
 import csv
-import datetime
-import torch
-import shutil
 import time
+import shutil
+import logging
+import datetime
+
+import cv2
+import torch
+import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from torch.amp import autocast
-import logging
+import albumentations as albu
 
-def main(args: dict, 
-         cap: cv2.VideoCapture, 
-         video: cv2.VideoWriter,  
-         video_length:int, 
-         final:np.ndarray, 
-         bgimg:np.ndarray, 
-         energy_opt:bool=True, 
-         epochs:int=1000, 
-         final_video_name:str=None,
-         size:tuple=(1080, 1920)
-        ):
-    
-    start_time = time.time()  # Start the timer
+from sort import Sort
+from utils import pad_image, pad_to_max_shape
+from energy import optimize_tube
+from tube_util import Tube, convert_directory_csv_to_txt
+from people_segmentation.pre_trained_models import create_model
+from supplementary.our_args import args, save_yaml_config, CONFIG_PATH
+from iglovikov_helper_functions.dl.pytorch.utils import tensor_from_rgb_image
+
+def run_inference_on_batch(frames: List[np.ndarray], args: dict) -> List[np.ndarray]:
+    """
+    Runs model inference on a batch of frames and returns binary masks.
+
+    Args:
+        frames (List[np.ndarray]): List of frames.
+        args (dict): Configuration arguments.
+
+    Returns:
+        List[np.ndarray]: List of binary masks.
+    """
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    log.info(f'[Info] Device :**{device}** \u2705')
+
+    model = create_model(args['input_model']).to(device)
+    batch_size = args['batch_size']
+
+    if torch.cuda.device_count() > 1:
+        log.info(f"Using {torch.cuda.device_count()} GPUs!")
+        batch_size *= torch.cuda.device_count()
+        model = torch.nn.DataParallel(model)
+    
+    model.eval()
+    transform = albu.Compose([albu.Normalize(p=1)], p=1)
+
+    transformed_batch = []
+    for frame in frames:
+        transformed = transform(image=frame)["image"]
+        padded_frame, _ = pad_image(transformed)
+        transformed_batch.append(tensor_from_rgb_image(padded_frame))
+
+    x = torch.stack(transformed_batch).to(device)
+
+    with torch.no_grad():
+        if device == 'cuda':
+            with autocast(device):
+                predictions = model(x)
+        else:
+            predictions = model(x)
+
+    return [(pred[0].cpu().numpy() > 0).astype(np.uint8) for pred in predictions]
+
+
+def generate_tubes_online(args: dict, cap: cv2.VideoCapture, video_length: int, fps: int=15) -> int:
+    """
+    Perform online tube generation:  
+    - Read frames, preprocess, run inference via `run_inference_on_batch`, track objects  
+    - Save object regions and metadata  
+
+    Returns:
+        int: Total image count processed.
+    """
+    log.info(f'[Info] Using device: {"CUDA" if torch.cuda.is_available() else "CPU"} ✅')
+
+    tracker = Sort(max_age=3, min_hits=3, iou_threshold=0.3)
+    pbar = tqdm(total=video_length // args['batch_size'], desc='⏳ Processing Batches', unit='batch')
+
     image_number = 1
     next_available_id = 1
     object_id_mapping = {}
 
-    model = create_model(args['input_model']).to(device)
-    batch_size = args['batch_size']
-    if torch.cuda.device_count() > 1:
-        log.info(f"Using {torch.cuda.device_count()} GPUs!")
-        batch_size = batch_size * int(torch.cuda.device_count())
-        model = torch.nn.DataParallel(model)
-    model.eval()
-
-    transform = albu.Compose([albu.Normalize(p=1)], p=1)
-    tracker = Sort(max_age=3, min_hits=3, iou_threshold=0.3)
-    
-    
-    pbar = tqdm(total=video_length//batch_size, desc='⏳ Processing Batches', unit='batch')
-    
     frame_index = 0
     height, width = None, None
-    
+
     while True:
         frames_batch = []
         frame_indices = []
-        
-        # Read batch of frames
-        for _ in range(batch_size):
+
+        for _ in range(args['batch_size']):
             ret, frame = cap.read()
             if not ret:
                 break
@@ -69,111 +97,120 @@ def main(args: dict,
             frames_batch.append(frame)
             frame_indices.append(frame_index)
             frame_index += 1
-        
+
         if not frames_batch:
             break
-        
-        # Preprocess batch
-        transformed_batch = []
-        original_batch = []
-        for frame in frames_batch:
-            original = frame.copy()
-            transformed = transform(image=frame)["image"]
-            padded_frame, _ = pad_image(transformed)
-            transformed_batch.append(tensor_from_rgb_image(padded_frame))
-            original_batch.append(original)
-        
-        # Create batch tensor
-        x = torch.stack(transformed_batch).to(device)
-        
-        # Model inference with mixed precision
-        with torch.no_grad():
-            if device == 'cuda':
-                with autocast(device):
-                    predictions = model(x)
-            else:
-                predictions = model(x)
-        
-        # Process each frame in the batch
-        for i, (pred, original) in enumerate(zip(predictions, original_batch)):
-            current_time = frame_indices[i] / fps  # Calculate from frame index and FPS
-            
-            # Process prediction
-            output_img = (pred[0].cpu().numpy() > 0).astype(np.uint8)
-            if output_img.size == 0:
+
+        # Run inference to get binary masks
+        binary_masks = run_inference_on_batch(frames_batch, args)
+
+        for i, (mask, original) in enumerate(zip(binary_masks, frames_batch)):
+            current_time = frame_indices[i] / fps
+
+            if mask.size == 0:
                 continue
-            
-            output_img = cv2.resize(output_img, (width, height))
-            mask_e = output_img * 255
-            contours, _ = cv2.findContours(output_img, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+            mask = cv2.resize(mask, (width, height))
+            mask_e = mask * 255
+            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
             detections = []
-            
+
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
                 if cv2.contourArea(contour) > (width * height) // 90:
                     detections.append([x, y, x + w, y + h])
-            
+
             if detections:
                 tracked_objects = tracker.update(np.array(detections))
+
                 for track in tracked_objects:
                     objectID = int(track[4])
                     coords = [max(0, int(coord)) for coord in track[:4]]
-                    
+
                     if objectID not in object_id_mapping:
                         object_id_mapping[objectID] = next_available_id
                         next_available_id += 1
-                    
+
                     new_id = object_id_mapping[objectID]
                     ROI = original[coords[1]:coords[3], coords[0]:coords[2]]
                     mask_roi = mask_e[coords[1]:coords[3], coords[0]:coords[2]]
-                    
+
                     if ROI.size == 0:
                         continue
-                    
-                    # Save outputs
+
                     TubeID = str(new_id).zfill(4)
                     curr_time_str = f'{current_time:.2f}'
                     os.makedirs(TubeID, exist_ok=True)
                     os.makedirs(f'../masks/{TubeID}', exist_ok=True)
-                    
+
                     cv2.imwrite(f'{TubeID}/{str(image_number).zfill(4)}{args["ext"]}', ROI)
                     cv2.imwrite(f'../masks/{TubeID}/{str(image_number).zfill(4)}{args["ext"]}', mask_roi)
-                    
-                    # Write metadata
+
                     with open(f'{TubeID}/{TubeID}node.txt', 'a') as f:
                         f.write(f'{TubeID}, {image_number}, {coords[0]}, {coords[2]}, {coords[1]}, {coords[3]}, {curr_time_str},\n')
-                    
+
                     with open(f'{TubeID}/{TubeID}node.csv', 'a', newline='') as csvfile:
                         writer = csv.writer(csvfile)
                         if csvfile.tell() == 0:
                             writer.writerow(['T', 'n', 'x1', 'y1', 'x2', 'y2', 'time', 'contour'])
                         writer.writerow([int(TubeID), image_number, *coords, curr_time_str, contour])
-                    
+
                     image_number += 1
-        
-        pbar.update(1)  # Update progress per batch
+
+        pbar.update(1)
         if image_number > video_length:
             log.info(f'[Info] image_number: {image_number} exceeds video_length: {video_length}')
             break
-    
+
     pbar.close()
+    cap.release()
+    return image_number
+
+
+def optimize_tubes(args: dict, 
+                   video: cv2.VideoWriter, 
+                   bgimg: np.ndarray, 
+                   final: np.ndarray, 
+                   video_length: int, 
+                   epochs: int):
+    """
+    Optimize tubes using either MCTS or Energy Optimization and stitch them into the final video.
+    """
+    log.info('[Info] Optimizing tubes with Energy Optimization...')
+    optimize_tube(
+        files_pattern=args['files_csv_dir'],
+        output_dir=args['optimized_tubes_dir'],
+        video_length=video_length,
+        epochs=epochs
+    )
+    convert_directory_csv_to_txt(args['optimized_tubes_dir'], args['optimized_tubes_dir'])
+    Tube(args, video, bgimg=bgimg, final=final, dir2=f"{args['optimized_tubes_dir']}/*.txt")
+
+def main(args: dict, 
+         cap: cv2.VideoCapture, 
+         video: cv2.VideoWriter, 
+         video_length: int, 
+         final: np.ndarray, 
+         bgimg: np.ndarray, 
+         energy_opt: bool = True, 
+         epochs: int = 1000, 
+         final_video_name: str = None, 
+         size: tuple = (1080, 1920)):
+    """
+    Main function to orchestrate online tube generation and optimization.
+    """
+    start_time = time.time()
     
-    # Post-processing (unchanged)
+    image_count = generate_tubes_online(args, cap, video_length)
+    
     if energy_opt:
-   
-        log.info(f'[Info] Optimizing tubes with Energy Optimization...')
-        optimize_tube(files_pattern=args['files_csv_dir'], output_dir=args['optimized_tubes_dir'], 
-                      video_length=video_length, epochs=epochs)
-            
-        convert_directory_csv_to_txt(args['optimized_tubes_dir'], args['optimized_tubes_dir'])
-        Tube(args, video, bgimg=bgimg, final=final, dir2 = f"{args['optimized_tubes_dir']}/*.txt")
+        optimize_tubes(args, video, bgimg, final, video_length, epochs, size)
     else:
         Tube(args, video, bgimg=bgimg, final=final, dir2="*/*.txt")
     
-    cap.release()
-    log.info(f'[Info] Video saved at {final_video_name} \u2705')
-    log.info(f'⏳ Total time: {time.time() - start_time:.2f}s \u23F1')
-    log.info(u'[Finish \U0001F64C \U0001F3C1]...')
+    log.info(f'[Info] Video saved at {final_video_name} ✅')
+    log.info(f'⏳ Total time: {time.time() - start_time:.2f}s ⏳')
+    log.info('[Finish 🙌 🏁]...')
 
 if __name__ == "__main__":
 
@@ -187,6 +224,10 @@ if __name__ == "__main__":
         )
     log = logging.getLogger(__name__)
     log.setLevel(logging.INFO)
+
+    
+    save_yaml_config(args, CONFIG_PATH)
+    log.info(args)
 
     # Set paths
     output_path = args["output"]
@@ -276,4 +317,4 @@ if __name__ == "__main__":
         raise ValueError("[Error]: Invalid frame dimensions. ❌")
 
     # Main processing
-    main(args, cap, video, video_length, final, bgimg, energy_opt, epochs, video_name, size=(frame_width, frame_height))
+    main(args, cap, video, video_length, final, bgimg, energy_opt, epochs, video_name,)
