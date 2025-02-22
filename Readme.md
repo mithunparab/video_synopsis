@@ -17,10 +17,6 @@
 
 ---
 
-### New Updates
-
-- Added support for multi gpu and batch processing for faster inference.
-- Added configuration management 
 ## Requirements
 
 - Python 3.8+
