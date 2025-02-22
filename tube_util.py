@@ -1,10 +1,10 @@
-import cv2
 import os
-import numpy as np
 import glob
+import cv2
+import numpy as np
+import pandas as pd
 from PIL import Image
 from tqdm import tqdm
-import pandas as pd
 from collections import defaultdict, deque
 
 def blend_roi_on_background(background, roi, roi_mask, x1, x2, y1, y2):
@@ -77,7 +77,7 @@ def temporal_smoothing(tube_queue, time_window=3):
                 smoothed_queue[curr_time].append((key[0], key[1], avg_x1, avg_x2, avg_y1, avg_y2))
     return smoothed_queue
 
-def Tube_mod(args, video, bgimg=None, final='../masks', dir1 = "*", dir2 = "../optimized_tubes"):
+def Tube_mod(args, video, bgimg=None, mask_dir='../masks', dir1 = "*", dir2 = "../optimized_tubes"):
     new_times = load_new_times(dir2)
     if bgimg is None:
         bgimg = np.asarray(Image.open('../bg/background_img.png'))
@@ -101,7 +101,7 @@ def Tube_mod(args, video, bgimg=None, final='../masks', dir1 = "*", dir2 = "../o
 
         for Tube, n, x1, x2, y1, y2 in tube_queue[curr_time]:
             image_path = f'{str(Tube).zfill(4)}/{str(n).zfill(4)}' + args['ext']
-            mask_path = f'{str(final).zfill(4)}/{str(Tube).zfill(4)}/{str(n).zfill(4)}' + args['ext']
+            mask_path = f'{str(mask_dir).zfill(4)}/{str(Tube).zfill(4)}/{str(n).zfill(4)}' + args['ext']
 
             image = np.asarray(Image.open(image_path))
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
@@ -148,26 +148,26 @@ def resize_tube(image, mask, x1, x2, y1, y2, min_size=50, reduction=2):
         y2 = y1 + new_height
     return image, mask, x1, x2, y1, y2
 
-# def create_composite_image(tube_queues, bg_shape):
-#     composite_image = np.zeros(bg_shape, dtype=np.uint8)
-#     composite_mask = np.zeros(bg_shape[:2], dtype=bool)
+def create_composite_image(tube_queues, bg_shape):
+    composite_image = np.zeros(bg_shape, dtype=np.uint8)
+    composite_mask = np.zeros(bg_shape[:2], dtype=bool)
 
-#     for Tube, frames in list(tube_queues.items()):
-#         if frames:
-#             _, x1, x2, y1, y2, image, mask = frames[0]
-#             for other_Tube, other_frames in list(tube_queues.items()):
-#                 if other_Tube != Tube and other_frames:
-#                     _, other_x1, other_x2, other_y1, other_y2, other_image, other_mask = other_frames[0]
-#                     if check_overlap(x1, x2, y1, y2, other_x1, other_x2, other_y1, other_y2):
-#                         image, mask, x1, x2, y1, y2 = resize_tube(image, mask, x1, x2, y1, y2)
-#                         other_image, other_mask, other_x1, other_x2, other_y1, other_y2 = resize_tube(other_image, other_mask, other_x1, other_x2, other_y1, other_y2)
-#             composite_image[y1:y2, x1:x2] = np.where(mask[:, :, None], image, composite_image[y1:y2, x1:x2])
-#             composite_mask[y1:y2, x1:x2] = mask.astype(bool)
-#             frames.popleft()
+    for Tube, frames in list(tube_queues.items()):
+        if frames:
+            _, x1, x2, y1, y2, image, mask = frames[0]
+            for other_Tube, other_frames in list(tube_queues.items()):
+                if other_Tube != Tube and other_frames:
+                    _, other_x1, other_x2, other_y1, other_y2, other_image, other_mask = other_frames[0]
+                    if check_overlap(x1, x2, y1, y2, other_x1, other_x2, other_y1, other_y2):
+                        image, mask, x1, x2, y1, y2 = resize_tube(image, mask, x1, x2, y1, y2)
+                        other_image, other_mask, other_x1, other_x2, other_y1, other_y2 = resize_tube(other_image, other_mask, other_x1, other_x2, other_y1, other_y2)
+            composite_image[y1:y2, x1:x2] = np.where(mask[:, :, None], image, composite_image[y1:y2, x1:x2])
+            composite_mask[y1:y2, x1:x2] = mask.astype(bool)
+            frames.popleft()
 
-#     return composite_image, composite_mask
+    return composite_image, composite_mask
 
-def create_composite_image(tube_queues, bg_shape, log):
+def create_composite_image_size_chagne(tube_queues, bg_shape, log):
     composite_image = np.zeros(bg_shape, dtype=np.uint8)
     composite_mask = np.zeros(bg_shape[:2], dtype=bool)
     processed = set()
@@ -233,15 +233,15 @@ def create_composite_image(tube_queues, bg_shape, log):
 def blend_on_background(background, composite_image, composite_mask):
     return np.where(composite_mask[:, :, None], composite_image, background)
 
-def process_tube_frame(Tube, n, x1, x2, y1, y2, final):
+def process_tube_frame(Tube, n, x1, x2, y1, y2, mask_dir):
     image_path = f'{str(Tube).zfill(4)}/{str(n).zfill(4)}.png'
-    mask_path = f'{final}/{str(Tube).zfill(4)}/{str(n).zfill(4)}.png'
+    mask_path = f'{mask_dir}/{str(Tube).zfill(4)}/{str(n).zfill(4)}.png'
     image = np.asarray(Image.open(image_path))
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     mask = np.asarray(Image.open(mask_path), dtype=np.uint8)
     return image, mask, (x1, x2, y1, y2)
 
-def load_tube_data(dir2, final):
+def load_tube_data(dir2, mask_dir):
     tube_queues = defaultdict(deque)
     filenames = sorted(glob.glob(dir2))
     for filename in tqdm(filenames, desc=u'⏳ Loading tube data'):
@@ -250,7 +250,7 @@ def load_tube_data(dir2, final):
                 if line.strip():
                     line = line.split(',')
                     Tube, n, x1, x2, y1, y2 = int(line[0]), int(line[1]), int(line[2]), int(line[3]), int(line[4]), int(line[5])
-                    image, mask, coords = process_tube_frame(Tube, n, x1, x2, y1, y2, final)
+                    image, mask, coords = process_tube_frame(Tube, n, x1, x2, y1, y2, mask_dir)
                     tube_queues[Tube].append((n, *coords, image, mask))
     return tube_queues
 
@@ -287,17 +287,17 @@ def csv_to_txt(csv_file_path:str, txt_file_path:str):
 def Tube(args: dict, 
          video: cv2.VideoWriter,  
          bgimg:np.array=None, 
-         final:str='../masks', 
+         mask_dir:str='../masks', 
          dir2:str="../optimized_tubes/*.txt",
          log=None):
-    tube_queues = load_tube_data(dir2, final)
+    tube_queues = load_tube_data(dir2, mask_dir)
     if bgimg is None:
         bgimg = np.asarray(Image.open(args['bg_path']))
         bgimg = cv2.cvtColor(bgimg, cv2.COLOR_RGB2BGR)
 
     max_frames = max(len(frames) for frames in tube_queues.values())
     for _ in tqdm(range(max_frames), desc=u'⏳ Processing frames'):
-        composite_image, composite_mask = create_composite_image(tube_queues, bgimg.shape, log)
+        composite_image, composite_mask = create_composite_image_size_chagne(tube_queues, bgimg.shape, log)
         current_bg = blend_on_background(np.copy(bgimg), composite_image, composite_mask)
         video.write(current_bg)
 

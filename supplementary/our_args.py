@@ -8,7 +8,7 @@ def load_yaml_config(config_path):
     """Load configuration from a YAML file."""
     if os.path.exists(config_path):
         with open(config_path, "r") as f:
-            return yaml.safe_load(f) or {}  # Ensure it returns a dict, even if file is empty
+            return yaml.safe_load(f) or {} 
     return {}
 
 def save_yaml_config(config, config_path):
@@ -16,7 +16,6 @@ def save_yaml_config(config, config_path):
     with open(config_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False)
 
-# Create an ArgumentParser instance
 parser = argparse.ArgumentParser(description="Process video and perform energy optimization for video synopsis.")
 
 parser.add_argument(
@@ -50,10 +49,10 @@ parser.add_argument(
     default=9
 )
 parser.add_argument(
-    "-f", "--frame", 
+    "-f", "--fps", 
     help="Frames per second (FPS) for video processing (default: 15)", 
     type=int, 
-    default=15
+    default=25
 )
 parser.add_argument(
     "-bsz", "--batch_size", 
@@ -109,6 +108,19 @@ parser.add_argument(
     help="Path to the extracted background image (default: '../bg/background_img.png')", 
     type=str, 
     default="../bg/background_img.png"
+)
+parser.add_argument(
+    "--sigma", 
+    help="Sigma value for Gaussian blur (default: 1.5)",
+    type=float, 
+    default=50.0
+)
+
+parser.add_argument(
+    "--collision_method",
+    help="Method to handle collisions (default: 'repulsion')", 
+    type=str, 
+    default='repulsion',
 )
 
 args = vars(parser.parse_args())

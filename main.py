@@ -1,26 +1,28 @@
 import os
 import csv
-import time
-import shutil
-import logging
 import datetime
+import shutil
+import time
+import logging
+import sys
 
 import cv2
-import torch
 import numpy as np
+import torch
 from PIL import Image
 from tqdm import tqdm
 from typing import List
 from torch.amp import autocast
 import albumentations as albu
+from iglovikov_helper_functions.dl.pytorch.utils import tensor_from_rgb_image
 
 from sort import Sort
-from utils import pad_image, pad_to_max_shape
-from energy import optimize_tube
 from tube_util import Tube, convert_directory_csv_to_txt
-from people_segmentation.pre_trained_models import create_model
 from supplementary.our_args import args, save_yaml_config, CONFIG_PATH
-from iglovikov_helper_functions.dl.pytorch.utils import tensor_from_rgb_image
+from energy import optimize_tube
+from mcts_net import optimize_tubes_with_mcts_alpha_zero
+from utils import pad_image, pad_to_max_shape
+from people_segmentation.pre_trained_models import create_model
 
 def run_inference_on_batch(frames: List[np.ndarray], args: dict) -> List[np.ndarray]:
     """
@@ -39,7 +41,6 @@ def run_inference_on_batch(frames: List[np.ndarray], args: dict) -> List[np.ndar
     batch_size = args['batch_size']
 
     if torch.cuda.device_count() > 1:
-        log.info(f"Using {torch.cuda.device_count()} GPUs!")
         batch_size *= torch.cuda.device_count()
         model = torch.nn.DataParallel(model)
     
@@ -102,7 +103,6 @@ def generate_tubes_online(args: dict, cap: cv2.VideoCapture, video_length: int, 
         if not frames_batch:
             break
 
-        # Run inference to get binary masks
         binary_masks = run_inference_on_batch(frames_batch, args)
 
         for i, (mask, original) in enumerate(zip(binary_masks, frames_batch)):
@@ -167,91 +167,101 @@ def generate_tubes_online(args: dict, cap: cv2.VideoCapture, video_length: int, 
     cap.release()
     return image_number
 
-
 def optimize_tubes(args: dict, 
                    video: cv2.VideoWriter, 
                    bgimg: np.ndarray, 
-                   final: np.ndarray, 
+                   mask_dir: str, 
                    video_length: int, 
-                   epochs: int):
+                   epochs: int, 
+                   size: tuple):
     """
     Optimize tubes using either MCTS or Energy Optimization and stitch them into the final video.
     """
-    log.info('[Info] Optimizing tubes with Energy Optimization...')
-    optimize_tube(
-        files_pattern=args['files_csv_dir'],
-        output_dir=args['optimized_tubes_dir'],
-        video_length=video_length,
-        epochs=epochs
-    )
-    convert_directory_csv_to_txt(args['optimized_tubes_dir'], args['optimized_tubes_dir'])
-    Tube(args, video, bgimg=bgimg, final=final, dir2=f"{args['optimized_tubes_dir']}/*.txt")
+    if args['use_mcts']:
+        log.info('[Info] Optimizing tubes with MCTS AlphaZero...')
+        optimize_tubes_with_mcts_alpha_zero(
+            files_pattern=args['files_csv_dir'],
+            output_dir=args['optimized_tubes_dir'],
+            video_length=video_length,
+            mcts_iterations=args['mcts_epochs'],
+            size=size,
+            log=log,
+            collision_method=args['collision_method'],
+        )
+        convert_directory_csv_to_txt(args['optimized_tubes_dir'], args['optimized_tubes_dir'])
+        Tube(args, video, bgimg=bgimg, mask_dir=mask_dir, dir2=f"{args['optimized_tubes_dir']}/*.txt")
+    else:
+        log.info('[Info] Optimizing tubes with Energy Optimization...')
+        optimize_tube(
+            files_pattern=args['files_csv_dir'],
+            output_dir=args['optimized_tubes_dir'],
+            video_length=video_length,
+            epochs=epochs,
+            collision_method=args['collision_method'],
+            sigma=args['sigma'],
+        )
+        convert_directory_csv_to_txt(args['optimized_tubes_dir'], args['optimized_tubes_dir'])
+        Tube(args, video, bgimg=bgimg, mask_dir=mask_dir, dir2=f"{args['optimized_tubes_dir']}/*.txt")
+
 
 def main(args: dict, 
          cap: cv2.VideoCapture, 
          video: cv2.VideoWriter, 
          video_length: int, 
-         final: np.ndarray, 
+         mask_dir: str, 
          bgimg: np.ndarray, 
          energy_opt: bool = True, 
          epochs: int = 1000, 
          final_video_name: str = None, 
+         fps: int = 15,
          size: tuple = (1080, 1920)):
     """
     Main function to orchestrate online tube generation and optimization.
     """
     start_time = time.time()
     
-    image_count = generate_tubes_online(args, cap, video_length)
+    image_count = generate_tubes_online(args, cap, video_length, fps=fps)
     
     if energy_opt:
-        optimize_tubes(args, video, bgimg, final, video_length, epochs)
+        optimize_tubes(args, video, bgimg, mask_dir, video_length, epochs, size)
     else:
-        Tube(args, video, bgimg=bgimg, final=final, dir2="*/*.txt")
+        Tube(args, video, bgimg=bgimg, mask_dir=mask_dir, dir2="*/*.txt")
     
     log.info(f'[Info] Video saved at {final_video_name} ✅')
     log.info(f'⏳ Total time: {time.time() - start_time:.2f}s ⏳')
     log.info('[Finish 🙌 🏁]...')
 
 if __name__ == "__main__":
-
     logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler("video_synopsis.log"),  
-            logging.StreamHandler() 
-            ]
-        )
-    log = logging.getLogger(__name__)
-    log.setLevel(logging.INFO)
+    stream=sys.stdout,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+    )
 
-    
+    log = logging.getLogger(__name__)
+    log.info("Logger initialized successfully.")
+
     save_yaml_config(args, CONFIG_PATH)
     log.info(args)
 
-    # Set paths
     output_path = args["output"]
-    final = args["masks"]
+    mask_dir = args["masks"]
     synopsis_frames = args["synopsis_frames"]
     energy_opt = args["energy_optimization"]
     epochs = args["epochs"]
 
-    # Create or clear directories
     def prepare_directory(path):
         if os.path.exists(path):
             shutil.rmtree(path)
         os.mkdir(path)
 
-    for path in [output_path, synopsis_frames, final]:
+    for path in [output_path, synopsis_frames, mask_dir]:
         prepare_directory(path)
         if str(path) is str(output_path): os.chdir(output_path) 
-
-    # Configure background subtraction
+    
     fgbg = cv2.createBackgroundSubtractorKNN(127, cv2.THRESH_BINARY, 1)
     fgbg.setDetectShadows(False)
 
-    # Video capture configuration
     video_path = args["video"]
     cap = cv2.VideoCapture(video_path)      
     cap1 = cv2.VideoCapture(video_path)     
@@ -259,19 +269,16 @@ if __name__ == "__main__":
     if not cap.isOpened() or not cap1.isOpened():
         log.error(f"[Error]: Unable to open video file {video_path}")
         raise RuntimeError(f"[Error]: Unable to open video file {video_path}")
-
-    # Obtain video properties
+    
     frame_width = int(cap1.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap1.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = int(cap1.get(cv2.CAP_PROP_FPS))
     video_length = int(cap1.get(cv2.CAP_PROP_FRAME_COUNT)) - 1
 
-    # Output video properties
     log.info(f"[Original Video] Frame Width: {frame_width}, Frame Height: {frame_height} ✅")
     log.info(f"[Original Video] Total Frames: {video_length} ✅")
     log.info(f"[Original Video] FPS: {fps} ✅")
 
-    # Random frame selection for background median
     total_frames = int(cap1.get(cv2.CAP_PROP_FRAME_COUNT))
     rand_ids = np.random.choice(total_frames, size=fps, replace=False)
     sampled_frames = []
@@ -282,32 +289,25 @@ if __name__ == "__main__":
         if ret and frame is not None:
             sampled_frames.append(frame)
 
-    # Ensure all frames are padded to the same size
     padded_frames = pad_to_max_shape(sampled_frames)
 
-    # Compute median frame and save it
     median_frame = np.median(padded_frames, axis=0).astype(np.uint8)
     bg_path = args["bg_path"]
     bg_dir = os.path.dirname(bg_path)
 
-    # Ensure the directory exists
     if not os.path.exists(bg_dir):
         os.makedirs(bg_dir)  
     cv2.imwrite(bg_path, median_frame)
-
-    # Preprocess median frame
     gray_median = cv2.cvtColor(median_frame, cv2.COLOR_BGR2GRAY)
     smooth_median = cv2.GaussianBlur(gray_median, (5, 5), 0)
 
-    # Load and prepare background image
     bgimg = np.asarray(Image.open(bg_path))
     bgimg = cv2.cvtColor(bgimg, cv2.COLOR_RGB2BGR)
 
-    # Video writer setup
     if frame_width > 0 and frame_height > 0:
         video_name = f"../{datetime.datetime.now().strftime('%Y_%m_%d-%H_%M_%S')}.mp4"
         video = cv2.VideoWriter(
-            video_name, cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame_width, frame_height)
+            video_name, cv2.VideoWriter_fourcc(*"mp4v"), args['fps'], (frame_width, frame_height)
         )
 
         if not video.isOpened():
@@ -317,5 +317,4 @@ if __name__ == "__main__":
         log.error("[Error]: Invalid frame dimensions")
         raise ValueError("[Error]: Invalid frame dimensions. ❌")
 
-    # Main processing
-    main(args, cap, video, video_length, final, bgimg, energy_opt, epochs, video_name,)
+    main(args, cap, video, video_length, mask_dir, bgimg, energy_opt, epochs, video_name, fps=args['fps'], size=(frame_width, frame_height))
