@@ -55,15 +55,18 @@ class BoTSORTTracker(BaseTracker):
         if self._tracker is not None:
             return
         try:
-            from boxmot import BoTSORT
+            from boxmot import BotSort
         except ImportError:
-            raise ImportError(
-                "BoT-SORT requires the boxmot package. "
-                "Install with: pip install boxmot"
-            )
+            try:
+                from boxmot import BoTSORT as BotSort
+            except ImportError:
+                raise ImportError(
+                    "BoT-SORT requires the boxmot package. "
+                    "Install with: pip install boxmot"
+                )
 
         device = self._get_device()
-        self._tracker = BoTSORT(
+        self._tracker = BotSort(
             reid_weights=None,
             device=device,
             track_high_thresh=self.track_high_thresh,
