@@ -69,6 +69,10 @@ class Config:
     bg_path: str = "../bg/background_img.png"
     files_csv_dir: str = "*/*.csv"
 
+    # Device
+    device: str = ""      # "" = auto-detect, "cuda:0", "cpu", "mps"
+    num_gpus: int = 0     # 0 = auto (all available CUDA GPUs), 1 = single, N = use N GPUs
+
     # Storage
     use_npz: bool = True  # Use .npz instead of per-frame PNG/CSV
 
@@ -147,6 +151,11 @@ class Config:
         parser.add_argument("--optimized_tubes_dir", type=str, default=cls.optimized_tubes_dir)
         parser.add_argument("--bg_path", type=str, default=cls.bg_path)
         parser.add_argument("--files_csv_dir", type=str, default=cls.files_csv_dir)
+
+        parser.add_argument("--device", type=str, default=cls.device,
+                            help="Device: '' (auto), 'cuda:0', 'cpu', 'mps'")
+        parser.add_argument("--num_gpus", type=int, default=cls.num_gpus,
+                            help="Number of GPUs: 0=auto, 1=single, N=use N GPUs")
 
         parser.add_argument("--use_npz", action="store_true", default=cls.use_npz)
         parser.add_argument("--no_npz", action="store_true")

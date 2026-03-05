@@ -64,23 +64,49 @@ class Pipeline:
     def optimizer(self, val: BaseOptimizer) -> None:
         self._optimizer = val
 
-    def _create_segmenter(self) -> BaseSegmenter:
+    def _create_single_segmenter(self, device: str = "") -> BaseSegmenter:
+        """Create a segmenter instance on a specific device."""
         cfg = self.config
         if cfg.segmenter == "rfdetr":
             from video_synopsis.models.segmenters.rfdetr import RFDETRSegmenter
             return RFDETRSegmenter(
                 model_variant=cfg.rfdetr_variant,
                 threshold=cfg.rfdetr_threshold,
+                device=device,
             )
         elif cfg.segmenter == "fastsam":
             from video_synopsis.models.segmenters.fastsam import FastSAMSegmenter
-            return FastSAMSegmenter(model_path=cfg.fastsam_model)
+            return FastSAMSegmenter(model_path=cfg.fastsam_model, device=device)
         else:
             from video_synopsis.models.segmenters.people_seg import PeopleSegmenter
             return PeopleSegmenter(
                 model_name=cfg.input_model,
                 batch_size=cfg.batch_size,
+                device=device,
             )
+
+    def _resolve_num_gpus(self) -> int:
+        """Determine how many GPUs to use."""
+        if self.config.num_gpus > 0:
+            return self.config.num_gpus
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return torch.cuda.device_count()
+        except ImportError:
+            pass
+        return 1
+
+    def _create_segmenter(self) -> BaseSegmenter:
+        num_gpus = self._resolve_num_gpus()
+        if num_gpus > 1:
+            from video_synopsis.models.segmenters.multi_gpu import MultiGPUSegmenter
+            log.info(f"Creating multi-GPU segmenter with {num_gpus} GPUs")
+            return MultiGPUSegmenter(
+                factory_fn=self._create_single_segmenter,
+                gpu_ids=list(range(num_gpus)),
+            )
+        return self._create_single_segmenter(self.config.device)
 
     def _create_tracker(self) -> BaseTracker:
         cfg = self.config
@@ -93,6 +119,7 @@ class Pipeline:
                 track_buffer=cfg.botsort_track_buffer,
                 match_thresh=cfg.botsort_match_thresh,
                 with_reid=cfg.botsort_with_reid,
+                device=cfg.device,
             )
         elif cfg.tracker == "sam3":
             from video_synopsis.models.trackers.sam3_tracker import SAM3Tracker
