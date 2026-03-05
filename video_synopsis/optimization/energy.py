@@ -109,7 +109,7 @@ class EnergyOptimizer(BaseOptimizer):
                     video_length=video_length,
                     sample_step=self.sample_step,
                 )
-                grad[i] = (e_plus - energy_val) / eps
+                grad[i] = float(e_plus - energy_val) / eps
 
             # Manual gradient step
             with torch.no_grad():
