@@ -20,8 +20,8 @@ class RFDETRSegmenter(BaseSegmenter):
     Requires: pip install rfdetr
     """
 
-    # COCO person class id
-    PERSON_CLASS_ID = 0
+    # COCO class IDs for objects of interest (people + vehicles)
+    DEFAULT_CLASS_IDS = {0, 1, 2, 3, 4, 5, 7}  # person, bicycle, car, motorcycle, bus, truck, train
 
     def __init__(
         self,
@@ -29,12 +29,14 @@ class RFDETRSegmenter(BaseSegmenter):
         threshold: float = 0.5,
         device: str = "",
         min_area: int = 500,
+        class_ids: set = None,
     ):
         self.model_variant = model_variant
         self.threshold = threshold
         self.min_area = min_area
         self._device = device
         self._model = None
+        self.class_ids = class_ids if class_ids is not None else self.DEFAULT_CLASS_IDS
 
     def _ensure_model(self) -> None:
         if self._model is not None:
@@ -52,7 +54,8 @@ class RFDETRSegmenter(BaseSegmenter):
         else:
             self._model = RFDETRBase()
 
-        log.info(f"Loaded RF-DETR model (variant={self.model_variant})")
+        device_info = self._device or "auto"
+        log.info(f"Loaded RF-DETR model (variant={self.model_variant}, device={device_info})")
 
     def segment_batch(self, frames: List[np.ndarray]) -> List[SegmentationResult]:
         self._ensure_model()
@@ -72,8 +75,8 @@ class RFDETRSegmenter(BaseSegmenter):
 
             if boxes is not None and len(boxes) > 0:
                 for i in range(len(boxes)):
-                    # Filter to person class only
-                    if labels[i] != self.PERSON_CLASS_ID:
+                    # Filter to target classes
+                    if labels[i] not in self.class_ids:
                         continue
 
                     x1, y1, x2, y2 = boxes[i][:4].astype(int)

@@ -201,7 +201,7 @@ class Pipeline:
         log.info("Background extracted")
 
         # Generate tubes
-        tubes = self._generate_tubes(cap, video_length, fps, frame_width, frame_height)
+        tubes = self._generate_tubes(cap, video_length, fps, frame_width, frame_height, bgimg)
         cap.release()
         log.info(f"Generated {len(tubes)} tubes")
 
@@ -247,6 +247,20 @@ class Pipeline:
                 shutil.rmtree(path)
             os.makedirs(path, exist_ok=True)
 
+    @staticmethod
+    def _is_moving(frame: np.ndarray, bg: np.ndarray, x1: int, y1: int, x2: int, y2: int,
+                   motion_thresh: int = 30, motion_ratio: float = 0.15) -> bool:
+        """Check if the bbox region differs enough from background to be considered moving."""
+        roi_frame = frame[y1:y2, x1:x2]
+        roi_bg = bg[y1:y2, x1:x2]
+        if roi_frame.shape != roi_bg.shape:
+            roi_bg = cv2.resize(roi_bg, (roi_frame.shape[1], roi_frame.shape[0]))
+        diff = cv2.absdiff(roi_frame, roi_bg)
+        gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY) if diff.ndim == 3 else diff
+        moving_pixels = np.count_nonzero(gray_diff > motion_thresh)
+        total_pixels = gray_diff.size
+        return (moving_pixels / total_pixels) > motion_ratio if total_pixels > 0 else False
+
     def _generate_tubes(
         self,
         cap: cv2.VideoCapture,
@@ -254,6 +268,7 @@ class Pipeline:
         fps: int,
         width: int,
         height: int,
+        bgimg: np.ndarray = None,
     ) -> Dict[int, Tube]:
         """Run segmentation + tracking to generate tubes."""
         cfg = self.config
@@ -290,8 +305,17 @@ class Pipeline:
             for i, (seg, orig_frame) in enumerate(zip(seg_results, batch_frames)):
                 current_time = batch_indices[i] / fps
 
-                # Build detection array for tracker
-                if seg.bboxes:
+                # Filter to moving objects only (skip static/parked)
+                if seg.bboxes and bgimg is not None:
+                    moving_bboxes = []
+                    for bbox in seg.bboxes:
+                        bx1, by1, bx2, by2 = bbox.astype(int)
+                        bx1, by1 = max(0, bx1), max(0, by1)
+                        bx2, by2 = min(width, bx2), min(height, by2)
+                        if self._is_moving(orig_frame, bgimg, bx1, by1, bx2, by2):
+                            moving_bboxes.append(bbox)
+                    dets = np.array(moving_bboxes) if moving_bboxes else np.empty((0, 4))
+                elif seg.bboxes:
                     dets = np.array(seg.bboxes)
                 else:
                     dets = np.empty((0, 4))
