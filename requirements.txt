@@ -1,4 +1,3 @@
-streamlit
 numpy
 opencv-python
 Pillow
@@ -10,4 +9,20 @@ scikit-image
 people-segmentation
 iglovikov-helper-functions
 filterpy
-opencv-python-headless
+pandas
+pyyaml
+
+# Optional: WebUI
+streamlit
+
+# Optional: FastSAM segmenter
+# ultralytics
+
+# Optional: SAM3 tracker
+# transformers>=4.40
+
+# Optional: RF-DETR segmenter (default)
+# rfdetr
+
+# Optional: BoT-SORT tracker (default)
+# boxmot

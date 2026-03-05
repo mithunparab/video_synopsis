@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-synopsis"
+version = "0.2.0"
+description = "Condense long surveillance videos into short, non-chronological summaries"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "Pillow",
+    "albumentations",
+    "torch",
+    "tqdm",
+    "matplotlib",
+    "scikit-image",
+    "people-segmentation",
+    "iglovikov-helper-functions",
+    "filterpy",
+    "pandas",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+fastsam = ["ultralytics"]
+sam3 = ["transformers>=4.40"]
+rfdetr = ["rfdetr"]
+botsort = ["boxmot"]
+webui = ["streamlit"]
+all = ["ultralytics", "transformers>=4.40", "streamlit", "rfdetr", "boxmot"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+video-synopsis = "video_synopsis.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["video_synopsis*"]

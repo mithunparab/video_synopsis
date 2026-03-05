@@ -1,1 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
 .DS_Store
+._*
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Project outputs
+output/
+optimized_tubes/
+masks/
+synopsis_frames/
+bg/
+tubes_npz/
+*.mp4
+config.yaml
+
+# Jupyter
+.ipynb_checkpoints/
