@@ -24,9 +24,17 @@ class MultiGPUSegmenter(BaseSegmenter):
         gpu_ids: List[int],
     ):
         self._gpu_ids = gpu_ids
-        self._segmenters = [factory_fn(f"cuda:{gid}") for gid in gpu_ids]
+        # Initialize models sequentially to avoid race conditions
+        # (e.g. concurrent weight downloads). Inference runs in parallel.
+        self._segmenters = []
+        for gid in gpu_ids:
+            seg = factory_fn(f"cuda:{gid}")
+            # Trigger model download/load now, while still sequential
+            seg.segment_batch([np.zeros((64, 64, 3), dtype=np.uint8)])
+            self._segmenters.append(seg)
+            log.info(f"MultiGPUSegmenter: initialized GPU {gid}")
         self._pool = ThreadPoolExecutor(max_workers=len(gpu_ids))
-        log.info(f"MultiGPUSegmenter: using {len(gpu_ids)} GPUs: {gpu_ids}")
+        log.info(f"MultiGPUSegmenter: ready with {len(gpu_ids)} GPUs: {gpu_ids}")
 
     @property
     def num_gpus(self) -> int:
