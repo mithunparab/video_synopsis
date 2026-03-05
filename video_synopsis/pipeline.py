@@ -235,8 +235,21 @@ class Pipeline:
         stitcher = Stitcher(bgimg, fps=fps)
         stitcher.render(tubes, optimized_starts, output_video)
 
+        # Log timing summary
         elapsed = time.time() - start_time
-        log.info(f"Pipeline complete in {elapsed:.1f}s. Output: {output_video}")
+        orig_duration = video_length / fps
+        synopsis_duration = max(
+            (optimized_starts[tid] + tubes[tid].duration) for tid in tubes
+        )
+        orig_m, orig_s = divmod(int(orig_duration), 60)
+        syn_m, syn_s = divmod(int(synopsis_duration), 60)
+        log.info(
+            f"Original video: {orig_m}m {orig_s}s | "
+            f"Synopsis: {syn_m}m {syn_s}s | "
+            f"Compression: {orig_duration / synopsis_duration:.1f}x | "
+            f"Pipeline time: {elapsed:.1f}s"
+        )
+        log.info(f"Output: {output_video}")
 
         return output_video
 
