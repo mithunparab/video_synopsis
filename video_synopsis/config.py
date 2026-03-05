@@ -41,7 +41,7 @@ class Config:
 
     # Optimization
     energy_optimization: bool = True
-    optimizer: str = "mcts"  # "mcts", "energy", or "pso"
+    optimizer: str = "energy"  # "energy", "mcts", or "pso"
     epochs: int = 2000
     collision_method: str = "repulsion"
     sigma: float = 50.0
