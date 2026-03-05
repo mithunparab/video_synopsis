@@ -69,6 +69,7 @@ class BoTSORTTracker(BaseTracker):
         self._tracker = BotSort(
             reid_weights=None,
             device=device,
+            half=False,
             track_high_thresh=self.track_high_thresh,
             track_low_thresh=self.track_low_thresh,
             new_track_thresh=self.new_track_thresh,
