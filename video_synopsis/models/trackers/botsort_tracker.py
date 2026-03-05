@@ -66,8 +66,13 @@ class BoTSORTTracker(BaseTracker):
                 )
 
         device = self._get_device()
+        from pathlib import Path
+
+        # Newer boxmot requires a valid reid_weights path when with_reid=True.
+        # Use the boxmot default clip model; set with_reid=False if unavailable.
+        reid_weights = Path("osnet_x0_25_msmt17.pt") if self.with_reid else Path("")
         self._tracker = BotSort(
-            reid_weights=None,
+            reid_weights=reid_weights,
             device=device,
             half=False,
             track_high_thresh=self.track_high_thresh,
