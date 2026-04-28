@@ -76,6 +76,9 @@ class Config:
     # Storage
     use_npz: bool = True  # Use .npz instead of per-frame PNG/CSV
 
+    # Pre-augmented input mode: skip inference and load tubes from disk
+    tubes_npz_dir: str = ""  # If set, skip inference and load tubes (with metadata.json) from this dir
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -159,6 +162,9 @@ class Config:
 
         parser.add_argument("--use_npz", action="store_true", default=cls.use_npz)
         parser.add_argument("--no_npz", action="store_true")
+
+        parser.add_argument("--tubes_npz_dir", type=str, default=cls.tubes_npz_dir,
+                            help="Skip inference and load tubes from this dir (must contain metadata.json).")
 
         parsed = parser.parse_args(args)
         d = vars(parsed)

@@ -67,6 +67,7 @@ with st.form("input_form"):
         collision_method = st.selectbox("Collision Method:", ["repulsion", "iou"])
         energy_opt = st.checkbox("Enable Optimization:", value=True)
         use_npz = st.checkbox("Use NPZ Storage:", value=True)
+        num_gpus = st.number_input("GPUs (0=auto):", value=0, min_value=0, format="%d")
 
     submitted = st.form_submit_button("Run")
 
@@ -82,6 +83,7 @@ if submitted and video_path:
         collision_method=collision_method,
         energy_optimization=energy_opt,
         use_npz=use_npz,
+        num_gpus=num_gpus,
     )
 
     with st.spinner("Running Video Synopsis pipeline..."):

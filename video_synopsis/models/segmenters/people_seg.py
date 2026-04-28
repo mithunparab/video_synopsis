@@ -49,8 +49,6 @@ class PeopleSegmenter(BaseSegmenter):
         import albumentations as albu
 
         self._model = create_model(self.model_name).to(self.device)
-        if self.device == "cuda" and torch.cuda.device_count() > 1:
-            self._model = torch.nn.DataParallel(self._model)
         self._model.eval()
         self._transform = albu.Compose([albu.Normalize(p=1)], p=1)
 

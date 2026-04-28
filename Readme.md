@@ -1,20 +1,10 @@
 # Video Synopsis
 
-<div style="display: flex; align-items: center; gap: 10px;">
-    <a href="https://www.kaggle.com/code/mithunparab/video-synopsis" target="_blank">
-        <img src="https://kaggle.com/static/images/site-logo.png" alt="Kaggle Notebook" height="40" style="margin-bottom: -15px;">
-    </a>
-    <a href="https://colab.research.google.com/drive/1PxJu8XynAvpWxb_iNgpdFGYvHw5NQqnf?usp=sharing" target="_blank">
-        <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab">
-    </a>
-</div>
+
 
 ---
 
-<div style="text-align: center;">
-    <img src="static/video-synopsis-fig.jpg" alt="Video Synopsis Framework" width="500" height="500">
-    <p><em>Flow of video synopsis framework [1]</em></p>
-</div>
+*Flow of video synopsis framework [1]*
 
 ---
 
@@ -123,16 +113,19 @@ video_synopsis/
 ### Pluggable Models
 
 **Segmenters** (`--segmenter`):
+
 - `rfdetr` (default) - RF-DETR real-time DETR segmenter, 44.3 mAP @ 170 FPS (requires `pip install rfdetr`)
 - `people` - Pre-trained people segmentation Unet
 - `fastsam` - FastSAM via ultralytics (requires `pip install ultralytics`)
 
 **Trackers** (`--tracker`):
+
 - `botsort` (default) - BoT-SORT with ReID, MOT leaderboard #1 (requires `pip install boxmot`)
 - `sort` - SORT with Kalman filter
 - `sam3` - SAM3 tracker via transformers (requires `pip install transformers>=4.40`)
 
 **Optimizers** (`--optimizer`):
+
 - `mcts` (default) - MCTS+AlphaZero with neural network guidance
 - `energy` - Gradient-based energy minimization
 - `pso` - Particle Swarm Optimization (population-based, no gradient or NN overhead)
@@ -187,14 +180,13 @@ Sample video demonstrates the framework's effectiveness:
 
 [Download Video](https://drive.google.com/file/d/1ZqZ9bVY75VbuRh_A1Qfzaw0iLKpZV6X9/view?usp=sharing)
 
+
 | Original Video Time (sec) | Video Synopsis Time (sec) |
-|---------------------------|---------------------------|
+| ------------------------- | ------------------------- |
 | 49                        | 6                         |
 
-<div style="text-align: center;">
-    <img src="static/optimized_tubes_plot.png" alt="Initial vs optimized tubes">
-    <p>Initial arrangement of tubes (49 sec) vs Optimized arrangement (6 sec)</p>
-</div>
+
+Initial arrangement of tubes (49 sec) vs Optimized arrangement (6 sec)
 
 ## Dependencies
 

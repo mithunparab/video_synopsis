@@ -1,6 +1,7 @@
 """Main pipeline orchestrator for video synopsis."""
 
 import datetime
+import json
 import logging
 import os
 import shutil
@@ -176,9 +177,12 @@ class Pipeline:
             Path to the output synopsis video.
         """
         cfg = self.config
-        video_path = video_path or cfg.video
         start_time = time.time()
 
+        if cfg.tubes_npz_dir:
+            return self._run_from_tubes(start_time)
+
+        video_path = video_path or cfg.video
         log.info(f"Starting Video Synopsis pipeline for: {video_path}")
 
         # Setup directories
@@ -251,6 +255,71 @@ class Pipeline:
         )
         log.info(f"Output: {output_video}")
 
+        return output_video
+
+    def _run_from_tubes(self, start_time: float) -> str:
+        """Skip inference, load augmented tubes from disk, then optimize + stitch."""
+        cfg = self.config
+        log.info(f"Loading pre-saved tubes from: {cfg.tubes_npz_dir}")
+
+        meta_path = os.path.join(cfg.tubes_npz_dir, "metadata.json")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(
+                f"metadata.json not found in {cfg.tubes_npz_dir}. "
+                "Generate tubes via tube_augment.py first."
+            )
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        fps = int(meta.get("fps", cfg.fps))
+        video_length = int(meta["target_video_length_frames"])
+        bg_path = meta.get("bg_path") or cfg.bg_path
+
+        bgimg = cv2.imread(bg_path)
+        if bgimg is None:
+            raise FileNotFoundError(f"Cannot load background image: {bg_path}")
+        log.info(f"Background loaded: {bgimg.shape[1]}x{bgimg.shape[0]} from {bg_path}")
+
+        self._setup_dirs()
+
+        tubes = TubeArchive.load_all(cfg.tubes_npz_dir)
+        if not tubes:
+            log.warning("No tubes loaded. Cannot create synopsis.")
+            return ""
+        log.info(f"Loaded {len(tubes)} tubes; synthetic timeline = {video_length} frames @ {fps} fps")
+
+        optimized_starts: Dict[int, float] = {}
+        if cfg.energy_optimization:
+            log.info(f"Optimizing with {cfg.optimizer}...")
+            optimized_starts = self.optimizer.optimize(tubes, video_length)
+        else:
+            for tid, tube in tubes.items():
+                optimized_starts[tid] = tube.start_time
+
+        output_video = os.path.abspath(
+            os.path.join(
+                os.path.dirname(cfg.output) or ".",
+                f"{datetime.datetime.now().strftime('%Y_%m_%d-%H_%M_%S')}.mp4",
+            )
+        )
+        stitcher = Stitcher(bgimg, fps=fps)
+        stitcher.render(tubes, optimized_starts, output_video)
+
+        elapsed = time.time() - start_time
+        orig_duration = video_length / fps
+        synopsis_duration = max(
+            (optimized_starts[tid] + tubes[tid].duration) for tid in tubes
+        )
+        compression = orig_duration / synopsis_duration if synopsis_duration > 0 else 0.0
+        orig_m, orig_s = divmod(int(orig_duration), 60)
+        syn_m, syn_s = divmod(int(synopsis_duration), 60)
+        log.info(
+            f"Synthetic timeline: {orig_m}m {orig_s}s | "
+            f"Synopsis: {syn_m}m {syn_s}s | "
+            f"Compression: {compression:.1f}x | "
+            f"Pipeline time: {elapsed:.1f}s"
+        )
+        log.info(f"Output: {output_video}")
         return output_video
 
     def _setup_dirs(self) -> None:
