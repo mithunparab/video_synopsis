@@ -1,14 +1,24 @@
-"""Gradient-based energy optimizer using per-frame 3D collision detection."""
+"""Gradient-based energy optimizer using per-frame 3D collision detection.
+
+GPU-accelerated: all 2N+1 finite-difference perturbations per epoch are
+evaluated in a single batched ``compute_energy_torch`` call, and the
+position/momentum state lives on the chosen device.
+"""
 
 import logging
 import os
 from typing import Dict
 
 import numpy as np
+import torch
 
 from video_synopsis.data.types import Tube
 from video_synopsis.optimization.base import BaseOptimizer
-from video_synopsis.optimization.collision import compute_energy
+from video_synopsis.optimization.collision import (
+    TubeBatch,
+    compute_energy_torch,
+    pick_device,
+)
 from video_synopsis.optimization.visualize import save_initial_vs_optimized
 
 log = logging.getLogger(__name__)
@@ -17,10 +27,9 @@ log = logging.getLogger(__name__)
 class EnergyOptimizer(BaseOptimizer):
     """Optimizes tube start times by minimizing an energy function.
 
-    The key insight for video synopsis: start with all tubes packed at t=0,
-    then nudge them apart just enough to reduce spatial collisions.
-    This produces a short, dense synopsis where multiple tubes play
-    simultaneously (non-chronological).
+    Starts with all tubes packed near t=0, then nudges them apart just
+    enough to reduce spatial collisions. Produces a short, dense synopsis
+    where multiple tubes play simultaneously (non-chronological).
     """
 
     def __init__(
@@ -34,6 +43,8 @@ class EnergyOptimizer(BaseOptimizer):
         w_activity: float = 0.5,
         sample_step: int = 2,
         output_dir: str = "optimized_tubes_energy",
+        device: str = "",
+        chunk_size: int = 32,
     ):
         self.epochs = epochs
         self.lr = lr
@@ -44,111 +55,103 @@ class EnergyOptimizer(BaseOptimizer):
         self.w_activity = w_activity
         self.sample_step = sample_step
         self.output_dir = output_dir
+        self.device_pref = device
+        self.chunk_size = chunk_size
 
     def optimize(self, tubes: Dict[int, Tube], video_length_frames: int) -> Dict[int, float]:
         if not tubes:
             return {}
 
+        device = pick_device(self.device_pref or None)
+        log.info(f"EnergyOptimizer using device: {device}")
+
         tube_ids = sorted(tubes.keys())
         n = len(tube_ids)
 
-        # Compute max tube duration for target synopsis length
         max_tube_dur = max(t.duration for t in tubes.values())
-        # Target synopsis: a few multiples of the longest tube
         target_duration = max_tube_dur * min(3.0, max(1.5, n / 10.0))
         log.info(
             f"Optimizing {n} tubes. Max tube duration: {max_tube_dur:.1f}s, "
             f"Target synopsis: ~{target_duration:.1f}s"
         )
 
-        # Initialize: stagger tubes slightly so they don't all start at 0
-        # but pack them tightly within the target duration
-        starts = np.zeros(n, dtype=np.float64)
-        for i, tid in enumerate(tube_ids):
-            starts[i] = (i / max(n - 1, 1)) * max(0, target_duration - tubes[tid].duration)
+        batch = TubeBatch(tubes, device=device)
+        # Convert per-tube sample_step into a target sample count for the
+        # torch kernel. ~32 samples per overlap window is typical; halve when
+        # sample_step=2 to keep work proportional.
+        sample_count = max(4, 64 // max(self.sample_step, 1))
+
+        # Initial placement: stagger tubes within target duration.
+        durations_np = batch.durations.detach().cpu().numpy()
+        starts0 = np.zeros(n, dtype=np.float32)
+        denom = max(n - 1, 1)
+        for i in range(n):
+            starts0[i] = (i / denom) * max(0.0, target_duration - durations_np[i])
+
+        starts = torch.from_numpy(starts0).to(device)
+        upper = (target_duration - batch.durations).clamp(min=0.0)  # [N]
+        zero = torch.zeros((), device=device, dtype=batch.dtype)
+
+        momentum = torch.zeros_like(starts)
+        mu = 0.9
+        eps = 0.25
+        lr = self.lr
 
         best_energy = float("inf")
-        best_starts = starts.copy()
-        momentum = np.zeros_like(starts)
-        mu = 0.9  # momentum coefficient
+        best_starts = starts.clone()
+
+        # Precompute the batched perturbation matrix: [2N+1, N]
+        # row 0 = baseline, rows 1..N = +eps on dim k, rows N+1..2N = -eps on dim k.
+        eye = torch.eye(n, device=device, dtype=batch.dtype) * eps
 
         for epoch in range(self.epochs):
-            # Build starts dict
-            starts_dict = {tid: starts[i] for i, tid in enumerate(tube_ids)}
+            perturb = torch.cat(
+                [starts.unsqueeze(0), starts.unsqueeze(0) + eye, starts.unsqueeze(0) - eye],
+                dim=0,
+            )  # [2N+1, N]
 
-            # Compute energy
-            energy_val = compute_energy(
-                tubes, starts_dict,
+            energies = compute_energy_torch(
+                batch, perturb,
                 w_duration=self.w_duration,
                 w_collision=self.w_collision,
                 w_activity=self.w_activity,
                 method=self.collision_method,
                 sigma=self.sigma,
-                video_length=target_duration,
-                sample_step=self.sample_step,
-            )
+                video_length=float(target_duration),
+                sample_count=sample_count,
+                chunk_size=self.chunk_size,
+            )  # [2N+1]
 
+            energy_val = float(energies[0].item())
             if energy_val < best_energy:
                 best_energy = energy_val
-                best_starts = starts.copy()
+                best_starts = starts.clone()
 
-            # Numerical gradient via central finite differences (more stable)
-            eps = 0.25
-            grad = np.zeros(n, dtype=np.float64)
-            for i in range(n):
-                starts_plus = dict(starts_dict)
-                starts_minus = dict(starts_dict)
-                starts_plus[tube_ids[i]] = starts_dict[tube_ids[i]] + eps
-                starts_minus[tube_ids[i]] = starts_dict[tube_ids[i]] - eps
-                e_plus = compute_energy(
-                    tubes, starts_plus,
-                    w_duration=self.w_duration,
-                    w_collision=self.w_collision,
-                    w_activity=self.w_activity,
-                    method=self.collision_method,
-                    sigma=self.sigma,
-                    video_length=target_duration,
-                    sample_step=self.sample_step,
-                )
-                e_minus = compute_energy(
-                    tubes, starts_minus,
-                    w_duration=self.w_duration,
-                    w_collision=self.w_collision,
-                    w_activity=self.w_activity,
-                    method=self.collision_method,
-                    sigma=self.sigma,
-                    video_length=target_duration,
-                    sample_step=self.sample_step,
-                )
-                grad[i] = (e_plus - e_minus) / (2 * eps)
+            grad = (energies[1:n + 1] - energies[n + 1:2 * n + 1]) / (2 * eps)  # [N]
 
-            # Gradient descent with momentum
-            momentum = mu * momentum + self.lr * grad
-            starts -= momentum
+            momentum = mu * momentum + lr * grad
+            starts = starts - momentum
 
-            # Clamp: keep starts within [0, target_duration]
-            for i in range(n):
-                dur = tubes[tube_ids[i]].duration
-                starts[i] = np.clip(starts[i], 0.0, max(0.0, target_duration - dur))
+            # Clamp to [0, target_duration - tube_duration] per tube.
+            starts = torch.minimum(torch.maximum(starts, zero), upper)
 
-            # Decay learning rate
             if (epoch + 1) % 500 == 0:
-                self.lr *= 0.8
+                lr *= 0.8
 
             if (epoch + 1) % 200 == 0:
-                synopsis_len = max(
-                    starts[i] + tubes[tube_ids[i]].duration for i in range(n)
+                synopsis_len = float(
+                    (starts + batch.durations).max().item()
                 )
                 log.info(
                     f"Epoch {epoch+1}/{self.epochs}, Energy: {energy_val:.4f}, "
                     f"Best: {best_energy:.4f}, Synopsis: {synopsis_len:.1f}s"
                 )
 
-        # Build final result from best
-        result = {tid: float(best_starts[i]) for i, tid in enumerate(tube_ids)}
+        best_np = best_starts.detach().cpu().numpy()
+        result = {tid: float(best_np[i]) for i, tid in enumerate(tube_ids)}
 
-        synopsis_len = max(
-            best_starts[i] + tubes[tube_ids[i]].duration for i in range(n)
+        synopsis_len = float(
+            (best_starts + batch.durations).max().item()
         )
         log.info(
             f"Energy optimization complete. Best energy: {best_energy:.4f}, "
