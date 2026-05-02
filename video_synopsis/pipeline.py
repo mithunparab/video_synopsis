@@ -133,7 +133,7 @@ class Pipeline:
                 iou_threshold=cfg.sort_iou_threshold,
             )
 
-    def _create_optimizer(self) -> BaseOptimizer:
+    def _create_optimizer(self, fps: float = 30.0) -> BaseOptimizer:
         cfg = self.config
         if cfg.optimizer == "energy":
             from video_synopsis.optimization.energy import EnergyOptimizer
@@ -142,6 +142,7 @@ class Pipeline:
                 collision_method=cfg.collision_method,
                 sigma=cfg.sigma,
                 output_dir=cfg.optimized_tubes_dir,
+                fps=fps,
             )
         elif cfg.optimizer == "pso":
             from video_synopsis.optimization.pso import PSOOptimizer
@@ -154,6 +155,7 @@ class Pipeline:
                 collision_method=cfg.collision_method,
                 sigma=cfg.sigma,
                 output_dir=cfg.optimized_tubes_dir,
+                fps=fps,
             )
         else:
             from video_synopsis.optimization.mcts import MCTSOptimizer
@@ -167,6 +169,7 @@ class Pipeline:
                 sigma=cfg.sigma,
                 c_puct=cfg.mcts_c_puct,
                 output_dir=cfg.optimized_tubes_dir,
+                fps=fps,
             )
 
     def run(self, video_path: Optional[str] = None) -> str:
@@ -225,6 +228,7 @@ class Pipeline:
         optimized_starts: Dict[int, float] = {}
         if cfg.energy_optimization:
             log.info(f"Optimizing with {cfg.optimizer}...")
+            self._optimizer = self._create_optimizer(fps=float(fps))
             optimized_starts = self.optimizer.optimize(tubes, video_length)
         else:
             # Use original timestamps
@@ -293,6 +297,7 @@ class Pipeline:
         optimized_starts: Dict[int, float] = {}
         if cfg.energy_optimization:
             log.info(f"Optimizing with {cfg.optimizer}...")
+            self._optimizer = self._create_optimizer(fps=float(fps))
             optimized_starts = self.optimizer.optimize(tubes, video_length)
         else:
             for tid, tube in tubes.items():

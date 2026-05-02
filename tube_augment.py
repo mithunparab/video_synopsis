@@ -135,6 +135,26 @@ def speed_scale_tube(tube: Tube, scale: float) -> Tube:
     return Tube(tube_id=tube.tube_id, frames=new_frames)
 
 
+def shift_tube_to(tube: Tube, new_start_time: float) -> Tube:
+    """Shift every timestamp so the tube's first frame lands at ``new_start_time``."""
+    if tube.num_frames == 0:
+        return tube
+    t0 = float(tube.timestamps_array.min())
+    delta = new_start_time - t0
+    if abs(delta) < 1e-9:
+        return tube
+    new_frames = []
+    for f in tube.frames:
+        new_frames.append(TubeFrame(
+            frame_index=f.frame_index,
+            bbox=f.bbox.copy(),
+            mask=f.mask.copy(),
+            image=f.image.copy(),
+            timestamp=f.timestamp + delta,
+        ))
+    return Tube(tube_id=tube.tube_id, frames=new_frames)
+
+
 def augment_one(
     tube: Tube,
     new_id: int,
@@ -226,6 +246,20 @@ def main() -> None:
             next_id += 1
 
     log.info(f"Generated {len(augmented)} augmented tubes")
+
+    # Scatter each tube's first-frame timestamp uniformly across the synthetic
+    # timeline. This is purely cosmetic for the "Initial Arrangement" plot and
+    # for honest compression-ratio reporting — the optimizer always works in
+    # tube-relative time (ts - ts.min()) and ignores these offsets.
+    target_seconds = float(args.target_minutes) * 60.0
+    placed = {}
+    for tid, tube in augmented.items():
+        dur = tube.duration
+        slot_max = max(0.0, target_seconds - dur)
+        new_start = random.uniform(0.0, slot_max)
+        placed[tid] = shift_tube_to(tube, new_start)
+    augmented = placed
+
     TubeArchive.save_all(augmented, args.output_dir)
 
     target_frames = int(args.target_minutes * 60.0 * args.fps)

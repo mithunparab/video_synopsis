@@ -60,7 +60,7 @@ class MCTSNode:
         placed_tubes: Dict[int, float],
         remaining_tubes: List[int],
         tubes: Dict[int, Tube],
-        total_frames: int,
+        total_seconds: float,
         parent: Optional["MCTSNode"] = None,
         action_taken: Optional[int] = None,
         model: Optional[TubeNet] = None,
@@ -75,7 +75,7 @@ class MCTSNode:
         self.placed_tubes = placed_tubes
         self.remaining_tubes = remaining_tubes
         self.tubes = tubes
-        self.total_frames = total_frames
+        self.total_seconds = total_seconds
         self.parent = parent
         self.children: List["MCTSNode"] = []
         self.action_taken = action_taken
@@ -161,7 +161,7 @@ class MCTSNode:
             placed_tubes={**self.placed_tubes, action_id: start_time},
             remaining_tubes=[t for t in self.remaining_tubes if t != action_id],
             tubes=self.tubes,
-            total_frames=self.total_frames,
+            total_seconds=self.total_seconds,
             parent=self,
             action_taken=action_id,
             model=self.model,
@@ -181,7 +181,7 @@ class MCTSNode:
         tube = self.tubes[tube_id]
         duration = tube.duration
 
-        slots: List[Tuple[float, float]] = [(0.0, float(self.total_frames))]
+        slots: List[Tuple[float, float]] = [(0.0, float(self.total_seconds))]
 
         for placed_id, placed_start in current.items():
             placed_tube = self.tubes[placed_id]
@@ -224,7 +224,7 @@ class MCTSNode:
 
         for s, e in slots:
             if (e - s) >= duration:
-                return min(s, max(0.0, self.total_frames - duration))
+                return min(s, max(0.0, self.total_seconds - duration))
 
         # Fallback: place after all existing
         latest_end = 0.0
@@ -232,7 +232,7 @@ class MCTSNode:
             latest_end = max(
                 ps + self.tubes[tid].duration for tid, ps in current.items()
             )
-        return max(0.0, min(latest_end, self.total_frames - duration))
+        return max(0.0, min(latest_end, self.total_seconds - duration))
 
     def _create_input_vector(self) -> torch.Tensor:
         features: List[float] = []
@@ -247,26 +247,30 @@ class MCTSNode:
         for tid in all_ids:
             is_placed = 1.0 if tid in self.placed_tubes else 0.0
             start = self.placed_tubes.get(tid, 0.0)
-            norm_start = start / self.total_frames if self.total_frames > 0 else 0.0
+            norm_start = start / self.total_seconds if self.total_seconds > 0 else 0.0
             norm_dur = self.tubes[tid].duration / max_dur
             features.extend([is_placed, norm_start, norm_dur])
 
         return torch.tensor(features, dtype=torch.float32, device=self.device)
 
     def compute_reward_metric(self) -> float:
-        """Compute reward using corrected per-frame 3D collision."""
+        """Compute reward using corrected per-frame 3D collision.
+
+        Weights match Energy / PSO so all three optimizers minimize the same
+        objective: collision-strict (IoU) compression.
+        """
         if not self.placed_tubes:
             return 0.0
         return compute_energy(
             self.tubes,
             self.placed_tubes,
             w_duration=1.0,
-            w_collision=10.0,
-            w_activity=0.0,
+            w_collision=1000.0,
+            w_activity=10.0,
             method=self.collision_method,
             sigma=self.sigma,
-            video_length=float(self.total_frames),
-            sample_step=2,
+            video_length=float(self.total_seconds),
+            sample_step=1,
         )
 
     def backpropagate(self, value: float) -> None:
@@ -308,7 +312,7 @@ def mcts_search(root: MCTSNode, num_simulations: int) -> MCTSNode:
 def _self_play_episode(
     model: TubeNet,
     tubes: Dict[int, Tube],
-    total_frames: int,
+    total_seconds: float,
     device: str,
     collision_method: str,
     sigma: float,
@@ -322,7 +326,7 @@ def _self_play_episode(
         placed_tubes={},
         remaining_tubes=list(tubes.keys()),
         tubes=tubes,
-        total_frames=total_frames,
+        total_seconds=total_seconds,
         model=model,
         device=device,
         collision_method=collision_method,
@@ -402,7 +406,7 @@ class MCTSOptimizer(BaseOptimizer):
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
         output_dir: str = "optimized_tubes_mcts",
-        fps: int = 30,
+        fps: float = 30.0,
     ):
         self.video_size = video_size
         self.num_training_episodes = num_training_episodes
@@ -418,7 +422,7 @@ class MCTSOptimizer(BaseOptimizer):
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
         self.output_dir = output_dir
-        self.fps = fps
+        self.fps = float(fps)
 
     def optimize(self, tubes: Dict[int, Tube], video_length_frames: int) -> Dict[int, float]:
         if not tubes:
@@ -426,6 +430,23 @@ class MCTSOptimizer(BaseOptimizer):
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         log.info(f"MCTS optimizer using device: {device}")
+
+        # Convert frames -> seconds. tube.duration is in seconds, so MCTS needs
+        # to operate in seconds throughout (was mixing units before).
+        total_seconds = float(video_length_frames) / max(self.fps, 1e-6)
+        # Tighten the search horizon so MCTS doesn't try to schedule across the
+        # full augmented timeline (which produces multi-thousand-second
+        # synopses). target_duration ~= 3x max tube duration matches Energy.
+        max_tube_dur = max((t.duration for t in tubes.values()), default=1.0)
+        n = len(tubes)
+        target_duration = max_tube_dur * min(3.0, max(1.5, n / 10.0))
+        # Use the larger of target_duration and total_seconds as the hard
+        # ceiling so the scheduler has slack if collisions force expansion.
+        search_horizon = max(target_duration, total_seconds)
+        log.info(
+            f"MCTS horizon: target={target_duration:.1f}s, "
+            f"hard={search_horizon:.1f}s (video={total_seconds:.1f}s)"
+        )
 
         num_tubes = len(tubes)
         nn_input = num_tubes * 3
@@ -439,7 +460,7 @@ class MCTSOptimizer(BaseOptimizer):
             model.eval()
             for _ in tqdm(range(self.games_per_episode), desc=f"Games Ep.{episode+1}"):
                 data = _self_play_episode(
-                    model, tubes, video_length_frames, device,
+                    model, tubes, search_horizon, device,
                     self.collision_method, self.sigma,
                     self.mcts_sims_training, self.video_size,
                     self.c_puct, self.dirichlet_alpha, self.dirichlet_epsilon,
@@ -460,7 +481,7 @@ class MCTSOptimizer(BaseOptimizer):
                 placed_tubes=placements.copy(),
                 remaining_tubes=remaining.copy(),
                 tubes=tubes,
-                total_frames=video_length_frames,
+                total_seconds=search_horizon,
                 model=model,
                 device=device,
                 collision_method=self.collision_method,
@@ -480,7 +501,7 @@ class MCTSOptimizer(BaseOptimizer):
             action = best.action_taken
             placements[action] = best.placed_tubes[action]
             remaining.remove(action)
-            log.info(f"Placed tube {action} at {placements[action]:.2f}")
+            log.info(f"Placed tube {action} at {placements[action]:.2f}s")
 
         # Handle unplaced tubes
         if remaining:
@@ -489,7 +510,7 @@ class MCTSOptimizer(BaseOptimizer):
                 placed_tubes=placements.copy(),
                 remaining_tubes=remaining.copy(),
                 tubes=tubes,
-                total_frames=video_length_frames,
+                total_seconds=search_horizon,
                 model=None,
                 device="cpu",
             )
@@ -497,9 +518,8 @@ class MCTSOptimizer(BaseOptimizer):
                 start = temp._find_earliest_start_time(tid, placements)
                 placements[tid] = start
 
-        log.info(f"MCTS optimization complete. Placements: {placements}")
+        log.info(f"MCTS optimization complete. {len(placements)} placements.")
 
-        # Save visualization
         self._plot_results(tubes, placements, video_length_frames)
 
         return placements

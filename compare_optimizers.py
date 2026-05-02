@@ -66,7 +66,20 @@ def _resolve_video_length(
     return max_idx + 1, "max frame_index across tubes"
 
 
-def _build_optimizer(name: str, output_dir: str, args):
+def _resolve_fps(tubes_npz_dir: str, override: Optional[float]) -> float:
+    """fps for converting video_length_frames -> seconds inside optimizers."""
+    if override and override > 0:
+        return float(override)
+    meta_path = os.path.join(tubes_npz_dir, "metadata.json")
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if "fps" in meta:
+            return float(meta["fps"])
+    return 30.0
+
+
+def _build_optimizer(name: str, output_dir: str, args, fps: float):
     name = name.lower()
     if name == "energy":
         from video_synopsis.optimization.energy import EnergyOptimizer
@@ -75,6 +88,7 @@ def _build_optimizer(name: str, output_dir: str, args):
             collision_method=args.collision_method,
             sigma=args.sigma,
             output_dir=output_dir,
+            fps=fps,
         )
     if name == "pso":
         from video_synopsis.optimization.pso import PSOOptimizer
@@ -84,6 +98,7 @@ def _build_optimizer(name: str, output_dir: str, args):
             collision_method=args.collision_method,
             sigma=args.sigma,
             output_dir=output_dir,
+            fps=fps,
         )
     if name == "mcts":
         from video_synopsis.optimization.mcts import MCTSOptimizer
@@ -95,6 +110,7 @@ def _build_optimizer(name: str, output_dir: str, args):
             collision_method=args.collision_method,
             sigma=args.sigma,
             output_dir=output_dir,
+            fps=fps,
         )
     raise ValueError(f"Unknown optimizer: {name!r} (expected energy|pso|mcts)")
 
@@ -115,6 +131,7 @@ def _run_one_method(
     args,
     tubes: Dict[int, Tube],
     video_length: int,
+    fps: float,
     log: logging.Logger,
 ) -> Dict[int, float]:
     """Run a single optimizer in-process and return placements."""
@@ -122,7 +139,7 @@ def _run_one_method(
     log.info(f"=== Running {pretty} ===")
     method_dir = os.path.join(args.output_dir, name)
     os.makedirs(method_dir, exist_ok=True)
-    optimizer = _build_optimizer(name, method_dir, args)
+    optimizer = _build_optimizer(name, method_dir, args, fps)
     t0 = time.time()
     placements = optimizer.optimize(tubes, video_length)
     elapsed = time.time() - t0
@@ -147,6 +164,7 @@ def _spawn_subprocess(
         "--output_dir", args.output_dir,
         "--methods", method,
         "--video_length_frames", str(args.video_length_frames),
+        "--fps", str(args.fps),
         "--collision_method", args.collision_method,
         "--sigma", str(args.sigma),
         "--energy_epochs", str(args.energy_epochs),
@@ -201,8 +219,12 @@ def main() -> int:
                         help="Override the timeline length (frames). "
                              "Default: read metadata.json (augmented sets) or infer from tube frame indices.")
 
-    parser.add_argument("--collision_method", default="repulsion")
+    parser.add_argument("--collision_method", default="iou",
+                        help="iou (default, true overlap only) | repulsion (smooth proximity tax).")
     parser.add_argument("--sigma", type=float, default=50.0)
+    parser.add_argument("--fps", type=float, default=0.0,
+                        help="FPS for converting video_length_frames -> seconds. "
+                             "Default: read metadata.json or fall back to 30.")
 
     parser.add_argument("--energy_epochs", type=int, default=2000)
 
@@ -243,7 +265,9 @@ def main() -> int:
     log.info(f"Loaded {len(tubes)} tubes")
 
     video_length, source = _resolve_video_length(args.tubes_npz_dir, tubes, args.video_length_frames)
-    log.info(f"Video length: {video_length} frames (source: {source})")
+    fps = _resolve_fps(args.tubes_npz_dir, args.fps)
+    log.info(f"Video length: {video_length} frames @ {fps} fps "
+             f"= {video_length / fps:.1f}s (source: {source})")
 
     os.makedirs(args.output_dir, exist_ok=True)
     methods = [m.strip().lower() for m in args.methods.split(",") if m.strip()]
@@ -254,7 +278,7 @@ def main() -> int:
             log.error(f"--single_method expects exactly one method, got {methods}")
             return 1
         name = methods[0]
-        placements = _run_one_method(name, args, tubes, video_length, log)
+        placements = _run_one_method(name, args, tubes, video_length, fps, log)
         method_dir = os.path.join(args.output_dir, name)
         _save_placements(method_dir, placements)
         log.info(f"Wrote {_placements_path(method_dir)}")
@@ -296,7 +320,7 @@ def main() -> int:
     else:
         for name in methods:
             placements_per_method[_PRETTY_NAME.get(name, name)] = (
-                _run_one_method(name, args, tubes, video_length, log)
+                _run_one_method(name, args, tubes, video_length, fps, log)
             )
 
     if not placements_per_method:

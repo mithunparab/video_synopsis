@@ -37,15 +37,16 @@ class PSOOptimizer(BaseOptimizer):
         w: float = 0.7,
         c1: float = 1.5,
         c2: float = 1.5,
-        collision_method: str = "repulsion",
+        collision_method: str = "iou",
         sigma: float = 50.0,
         w_duration: float = 1.0,
-        w_collision: float = 10.0,
-        w_activity: float = 0.1,
-        sample_step: int = 2,
+        w_collision: float = 1000.0,
+        w_activity: float = 10.0,
+        sample_step: int = 1,
         output_dir: str = "optimized_tubes_pso",
         device: str = "",
-        chunk_size: int = 32,
+        chunk_size: int = 16,
+        fps: float = 30.0,
     ):
         self.num_particles = num_particles
         self.max_iterations = max_iterations
@@ -61,6 +62,7 @@ class PSOOptimizer(BaseOptimizer):
         self.output_dir = output_dir
         self.device_pref = device
         self.chunk_size = chunk_size
+        self.fps = float(fps)
 
     def optimize(self, tubes: Dict[int, Tube], video_length_frames: int) -> Dict[int, float]:
         if not tubes:
@@ -71,14 +73,25 @@ class PSOOptimizer(BaseOptimizer):
 
         tube_ids = sorted(tubes.keys())
         n_tubes = len(tube_ids)
-        video_length = float(video_length_frames)
+        video_length = float(video_length_frames) / max(self.fps, 1e-6)
         P = self.num_particles
 
         batch = TubeBatch(tubes, device=device)
-        sample_count = max(4, 64 // max(self.sample_step, 1))
+        sample_count = max(8, 128 // max(self.sample_step, 1))
+
+        # Init range stays tight (target_duration); hard bound is video_length.
+        # Activity penalty at compute_energy_torch is the soft compression
+        # budget — collision (high w_collision + IoU) keeps tubes apart.
+        max_tube_dur = float(batch.durations.max().item()) if n_tubes > 0 else 0.0
+        target_duration = max_tube_dur * min(3.0, max(1.5, n_tubes / 10.0))
+        log.info(
+            f"Init range: [0, target_duration={target_duration:.1f}s]; "
+            f"hard bound: {video_length:.1f}s"
+        )
 
         upper = (video_length - batch.durations).clamp(min=0.0)   # [N]
         lower = torch.zeros_like(upper)
+        init_upper = (target_duration - batch.durations).clamp(min=0.0)
 
         gen = torch.Generator(device=device).manual_seed(0) if device.type != "mps" else None
 
@@ -88,7 +101,7 @@ class PSOOptimizer(BaseOptimizer):
                 return torch.rand(shape, device=device, dtype=batch.dtype)
             return torch.rand(shape, device=device, dtype=batch.dtype, generator=gen)
 
-        positions = _rand(P, n_tubes) * (upper.unsqueeze(0) - lower.unsqueeze(0)) + lower.unsqueeze(0)
+        positions = _rand(P, n_tubes) * init_upper.unsqueeze(0) + lower.unsqueeze(0)
         velocities = torch.zeros_like(positions)
 
         personal_best_pos = positions.clone()
@@ -107,7 +120,7 @@ class PSOOptimizer(BaseOptimizer):
                 w_activity=self.w_activity,
                 method=self.collision_method,
                 sigma=self.sigma,
-                video_length=video_length,
+                video_length=target_duration,
                 sample_count=sample_count,
                 chunk_size=self.chunk_size,
             )  # [P]

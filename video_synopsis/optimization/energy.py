@@ -36,15 +36,16 @@ class EnergyOptimizer(BaseOptimizer):
         self,
         epochs: int = 2000,
         lr: float = 0.1,
-        collision_method: str = "repulsion",
+        collision_method: str = "iou",
         sigma: float = 50.0,
-        w_duration: float = 10.0,
-        w_collision: float = 1.0,
-        w_activity: float = 0.5,
-        sample_step: int = 2,
+        w_duration: float = 1.0,
+        w_collision: float = 1000.0,
+        w_activity: float = 10.0,
+        sample_step: int = 1,
         output_dir: str = "optimized_tubes_energy",
         device: str = "",
-        chunk_size: int = 32,
+        chunk_size: int = 16,
+        fps: float = 30.0,
     ):
         self.epochs = epochs
         self.lr = lr
@@ -57,6 +58,7 @@ class EnergyOptimizer(BaseOptimizer):
         self.output_dir = output_dir
         self.device_pref = device
         self.chunk_size = chunk_size
+        self.fps = float(fps)
 
     def optimize(self, tubes: Dict[int, Tube], video_length_frames: int) -> Dict[int, float]:
         if not tubes:
@@ -76,12 +78,10 @@ class EnergyOptimizer(BaseOptimizer):
         )
 
         batch = TubeBatch(tubes, device=device)
-        # Convert per-tube sample_step into a target sample count for the
-        # torch kernel. ~32 samples per overlap window is typical; halve when
-        # sample_step=2 to keep work proportional.
-        sample_count = max(4, 64 // max(self.sample_step, 1))
+        sample_count = max(8, 128 // max(self.sample_step, 1))
 
-        # Initial placement: stagger tubes within target duration.
+        # Initial placement: stagger tubes within target_duration so the
+        # finite-diff gradient sees overlap from the start.
         durations_np = batch.durations.detach().cpu().numpy()
         starts0 = np.zeros(n, dtype=np.float32)
         denom = max(n - 1, 1)
@@ -89,7 +89,13 @@ class EnergyOptimizer(BaseOptimizer):
             starts0[i] = (i / denom) * max(0.0, target_duration - durations_np[i])
 
         starts = torch.from_numpy(starts0).to(device)
-        upper = (target_duration - batch.durations).clamp(min=0.0)  # [N]
+        # Hard bounds: [0, video_length - duration]. Activity penalty (against
+        # target_duration) creates the soft compression budget; collision keeps
+        # tubes apart. Tubes can drift past target_duration if collision forces
+        # it. video_length comes in frames; convert to seconds so it lives in
+        # the same unit as tube.duration.
+        video_length_seconds = float(video_length_frames) / max(self.fps, 1e-6)
+        upper = (video_length_seconds - batch.durations).clamp(min=0.0)
         zero = torch.zeros((), device=device, dtype=batch.dtype)
 
         momentum = torch.zeros_like(starts)
