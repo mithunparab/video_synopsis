@@ -300,24 +300,59 @@ def main() -> int:
     if args.parallel:
         gpu_ids = _parse_gpus(args.gpus) if args.gpus else []
         if gpu_ids:
-            log.info(f"Parallel mode: round-robin GPU assignment over {gpu_ids}")
+            log.info(f"Parallel mode: queue-based, 1 method per GPU at a time over {gpu_ids}")
         else:
-            log.info("Parallel mode: no GPU pinning (CUDA_VISIBLE_DEVICES untouched)")
+            log.info("Parallel mode: no GPUs configured — running sequentially "
+                     "(use --gpus to enable parallelism, e.g. --gpus 0,1)")
 
-        procs: List[Tuple[str, subprocess.Popen]] = []
-        for i, name in enumerate(methods):
-            gpu = gpu_ids[i % len(gpu_ids)] if gpu_ids else None
-            procs.append((name, _spawn_subprocess(name, gpu, args, log)))
+        # Queue-based scheduler: never pack two methods onto the same GPU at
+        # the same time. When all GPUs are busy, wait for any to free up.
+        slots: List[Optional[int]] = list(gpu_ids) if gpu_ids else [None]
+        pending: List[str] = list(methods)
+        in_flight: Dict[str, Tuple[str, subprocess.Popen, float]] = {}
+        # in_flight maps slot_key -> (method_name, popen, start_time)
+        # slot_key is the str(gpu_id) (or "cpu") so we can free it when done.
 
+        def _slot_key(g: Optional[int]) -> str:
+            return "cpu" if g is None else str(g)
+
+        free_slots: List[Optional[int]] = list(slots)
         failed: List[str] = []
-        for name, proc in procs:
-            ret = proc.wait()
+
+        while pending or in_flight:
+            # Dispatch any pending method onto any free slot.
+            while pending and free_slots:
+                gpu = free_slots.pop(0)
+                method = pending.pop(0)
+                key = _slot_key(gpu)
+                proc = _spawn_subprocess(method, gpu, args, log)
+                in_flight[key] = (method, proc, time.time())
+
+            if not in_flight:
+                break
+
+            # Poll for the first finished subprocess.
+            done = None
+            while done is None:
+                for key, (method, proc, t0) in in_flight.items():
+                    ret = proc.poll()
+                    if ret is not None:
+                        done = (key, method, proc, t0, ret)
+                        break
+                if done is None:
+                    time.sleep(0.5)
+
+            key, method, proc, t0, ret = done
+            elapsed = time.time() - t0
+            del in_flight[key]
+            free_slots.append(None if key == "cpu" else int(key))
             if ret != 0:
-                log.error(f"{name} subprocess exited with code {ret} "
-                          f"(see {os.path.join(args.output_dir, name, 'stdout.log')})")
-                failed.append(name)
+                log.error(f"{method} (gpu={key}) exited with code {ret} after {elapsed:.1f}s "
+                          f"(see {os.path.join(args.output_dir, method, 'stdout.log')})")
+                failed.append(method)
             else:
-                log.info(f"{name} subprocess done")
+                log.info(f"{method} (gpu={key}) done in {elapsed:.1f}s; "
+                         f"queue: {len(pending)} pending, {len(in_flight)} running")
 
         for name in methods:
             if name in failed:
