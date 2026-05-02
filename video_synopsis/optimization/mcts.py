@@ -9,9 +9,6 @@ import math
 import os
 from typing import Dict, List, Optional, Tuple
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,6 +19,7 @@ from tqdm import tqdm
 from video_synopsis.data.types import Tube
 from video_synopsis.optimization.base import BaseOptimizer
 from video_synopsis.optimization.collision import compute_energy
+from video_synopsis.optimization.visualize import save_initial_vs_optimized
 
 log = logging.getLogger(__name__)
 
@@ -512,47 +510,5 @@ class MCTSOptimizer(BaseOptimizer):
         placements: Dict[int, float],
         video_length_frames: int,
     ) -> None:
-        try:
-            os.makedirs(self.output_dir, exist_ok=True)
-            fig = plt.figure(figsize=(20, 10))
-
-            ax1 = fig.add_subplot(121, projection="3d")
-            ax1.set_title("Initial Arrangement")
-            ax1.set_xlabel("X")
-            ax1.set_ylabel("Y")
-            ax1.set_zlabel("Time")
-
-            ax2 = fig.add_subplot(122, projection="3d")
-            ax2.set_title("Optimized Arrangement")
-            ax2.set_xlabel("X")
-            ax2.set_ylabel("Y")
-            ax2.set_zlabel("Time")
-
-            colors = plt.colormaps.get_cmap("tab20")
-
-            for i, (tid, tube) in enumerate(tubes.items()):
-                if tube.num_frames == 0:
-                    continue
-                bboxes = tube.bboxes_array
-                ts = tube.timestamps_array
-                cx = (bboxes[:, 0] + bboxes[:, 2]) / 2
-                cy = (bboxes[:, 1] + bboxes[:, 3]) / 2
-                color = colors(i / max(len(tubes), 1))
-
-                ax1.scatter(cx, cy, ts, s=10, color=color, label=f"Tube {tid}")
-
-                if tid in placements:
-                    shifted_ts = (ts - ts.min()) + placements[tid]
-                    ax2.scatter(cx, cy, shifted_ts, s=10, color=color, label=f"Tube {tid}")
-
-            if len(tubes) <= 20:
-                ax1.legend(fontsize="small")
-                ax2.legend(fontsize="small")
-
-            plt.tight_layout()
-            path = os.path.join(self.output_dir, "mcts_optimized_plot.png")
-            plt.savefig(path, dpi=300)
-            plt.close(fig)
-            log.info(f"Plot saved to {path}")
-        except Exception as e:
-            log.warning(f"Failed to save plot: {e}")
+        path = os.path.join(self.output_dir, "mcts_optimized_plot.png")
+        save_initial_vs_optimized(tubes, placements, path, method_name="MCTS+AlphaZero")

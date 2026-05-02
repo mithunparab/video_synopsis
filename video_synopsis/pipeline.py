@@ -141,6 +141,7 @@ class Pipeline:
                 epochs=cfg.epochs,
                 collision_method=cfg.collision_method,
                 sigma=cfg.sigma,
+                output_dir=cfg.optimized_tubes_dir,
             )
         elif cfg.optimizer == "pso":
             from video_synopsis.optimization.pso import PSOOptimizer
@@ -152,6 +153,7 @@ class Pipeline:
                 c2=cfg.pso_social,
                 collision_method=cfg.collision_method,
                 sigma=cfg.sigma,
+                output_dir=cfg.optimized_tubes_dir,
             )
         else:
             from video_synopsis.optimization.mcts import MCTSOptimizer

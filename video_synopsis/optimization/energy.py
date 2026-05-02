@@ -1,6 +1,7 @@
 """Gradient-based energy optimizer using per-frame 3D collision detection."""
 
 import logging
+import os
 from typing import Dict
 
 import numpy as np
@@ -8,6 +9,7 @@ import numpy as np
 from video_synopsis.data.types import Tube
 from video_synopsis.optimization.base import BaseOptimizer
 from video_synopsis.optimization.collision import compute_energy
+from video_synopsis.optimization.visualize import save_initial_vs_optimized
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +33,7 @@ class EnergyOptimizer(BaseOptimizer):
         w_collision: float = 1.0,
         w_activity: float = 0.5,
         sample_step: int = 2,
+        output_dir: str = "optimized_tubes_energy",
     ):
         self.epochs = epochs
         self.lr = lr
@@ -40,6 +43,7 @@ class EnergyOptimizer(BaseOptimizer):
         self.w_collision = w_collision
         self.w_activity = w_activity
         self.sample_step = sample_step
+        self.output_dir = output_dir
 
     def optimize(self, tubes: Dict[int, Tube], video_length_frames: int) -> Dict[int, float]:
         if not tubes:
@@ -150,4 +154,8 @@ class EnergyOptimizer(BaseOptimizer):
             f"Energy optimization complete. Best energy: {best_energy:.4f}, "
             f"Synopsis duration: {synopsis_len:.1f}s"
         )
+
+        path = os.path.join(self.output_dir, "energy_optimized_plot.png")
+        save_initial_vs_optimized(tubes, result, path, method_name="Energy (gradient)")
+
         return result

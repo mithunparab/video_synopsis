@@ -1,6 +1,7 @@
 """Particle Swarm Optimization for tube placement."""
 
 import logging
+import os
 from typing import Dict
 
 import numpy as np
@@ -8,6 +9,7 @@ import numpy as np
 from video_synopsis.data.types import Tube
 from video_synopsis.optimization.base import BaseOptimizer
 from video_synopsis.optimization.collision import compute_energy
+from video_synopsis.optimization.visualize import save_initial_vs_optimized
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +34,7 @@ class PSOOptimizer(BaseOptimizer):
         w_collision: float = 10.0,
         w_activity: float = 0.1,
         sample_step: int = 2,
+        output_dir: str = "optimized_tubes_pso",
     ):
         self.num_particles = num_particles
         self.max_iterations = max_iterations
@@ -44,6 +47,7 @@ class PSOOptimizer(BaseOptimizer):
         self.w_collision = w_collision
         self.w_activity = w_activity
         self.sample_step = sample_step
+        self.output_dir = output_dir
 
     def optimize(self, tubes: Dict[int, Tube], video_length_frames: int) -> Dict[int, float]:
         if not tubes:
@@ -119,4 +123,8 @@ class PSOOptimizer(BaseOptimizer):
 
         result = {tid: float(global_best_pos[i]) for i, tid in enumerate(tube_ids)}
         log.info(f"PSO optimization complete. Best energy: {global_best_fit:.4f}")
+
+        path = os.path.join(self.output_dir, "pso_optimized_plot.png")
+        save_initial_vs_optimized(tubes, result, path, method_name="PSO")
+
         return result
