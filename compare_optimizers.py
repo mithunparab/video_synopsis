@@ -5,23 +5,31 @@ Inputs are pre-generated tubes saved as .npz files (see TubeArchive.save_all
 or `--use_npz` in the main pipeline) — this avoids re-running detection and
 tracking for every optimizer.
 
-Usage:
+Usage (sequential):
     python compare_optimizers.py --tubes_npz_dir ./tubes_npz \\
         --output_dir ./comparison_out \\
         --methods energy,pso,mcts
 
+Usage (parallel, one method per GPU):
+    python compare_optimizers.py --tubes_npz_dir ./tubes_npz \\
+        --output_dir ./comparison_out \\
+        --methods energy,pso,mcts \\
+        --parallel --gpus 0,1
+
 Outputs:
-    <output_dir>/<method>_optimized_plot.png  — one per method (initial vs optimized)
-    <output_dir>/methods_comparison.png       — single figure with all methods
+    <output_dir>/<method>/<method>_optimized_plot.png  — initial vs optimized per method
+    <output_dir>/<method>/placements.json              — written when --parallel is used
+    <output_dir>/methods_comparison.png                — single figure with all methods
 """
 
 import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from video_synopsis.data.tube_store import TubeArchive
 from video_synopsis.data.types import Tube
@@ -98,6 +106,89 @@ _PRETTY_NAME = {
 }
 
 
+def _placements_path(method_dir: str) -> str:
+    return os.path.join(method_dir, "placements.json")
+
+
+def _run_one_method(
+    name: str,
+    args,
+    tubes: Dict[int, Tube],
+    video_length: int,
+    log: logging.Logger,
+) -> Dict[int, float]:
+    """Run a single optimizer in-process and return placements."""
+    pretty = _PRETTY_NAME.get(name, name)
+    log.info(f"=== Running {pretty} ===")
+    method_dir = os.path.join(args.output_dir, name)
+    os.makedirs(method_dir, exist_ok=True)
+    optimizer = _build_optimizer(name, method_dir, args)
+    t0 = time.time()
+    placements = optimizer.optimize(tubes, video_length)
+    elapsed = time.time() - t0
+    log.info(f"{pretty} finished in {elapsed:.1f}s with {len(placements)} placements")
+    return placements
+
+
+def _spawn_subprocess(
+    method: str,
+    gpu_id: Optional[int],
+    args,
+    log: logging.Logger,
+) -> subprocess.Popen:
+    """Re-invoke this script in --single_method mode pinned to one GPU."""
+    method_dir = os.path.join(args.output_dir, method)
+    os.makedirs(method_dir, exist_ok=True)
+    log_path = os.path.join(method_dir, "stdout.log")
+
+    cmd = [
+        sys.executable, os.path.abspath(__file__),
+        "--tubes_npz_dir", args.tubes_npz_dir,
+        "--output_dir", args.output_dir,
+        "--methods", method,
+        "--video_length_frames", str(args.video_length_frames),
+        "--collision_method", args.collision_method,
+        "--sigma", str(args.sigma),
+        "--energy_epochs", str(args.energy_epochs),
+        "--pso_num_particles", str(args.pso_num_particles),
+        "--pso_max_iterations", str(args.pso_max_iterations),
+        "--mcts_training_episodes", str(args.mcts_training_episodes),
+        "--mcts_games_per_episode", str(args.mcts_games_per_episode),
+        "--mcts_sims_training", str(args.mcts_sims_training),
+        "--mcts_sims_final", str(args.mcts_sims_final),
+        "--single_method",
+    ]
+
+    env = os.environ.copy()
+    if gpu_id is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    log.info(
+        f"Spawning {method} on GPU {gpu_id if gpu_id is not None else 'cpu'}; "
+        f"logs -> {log_path}"
+    )
+    log_fp = open(log_path, "w")
+    return subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT, env=env)
+
+
+def _save_placements(method_dir: str, placements: Dict[int, float]) -> None:
+    with open(_placements_path(method_dir), "w") as f:
+        json.dump({str(k): float(v) for k, v in placements.items()}, f)
+
+
+def _load_placements(method_dir: str) -> Optional[Dict[int, float]]:
+    p = _placements_path(method_dir)
+    if not os.path.exists(p):
+        return None
+    with open(p) as f:
+        raw = json.load(f)
+    return {int(k): float(v) for k, v in raw.items()}
+
+
+def _parse_gpus(spec: str) -> List[int]:
+    return [int(x) for x in spec.split(",") if x.strip()]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--tubes_npz_dir", required=True,
@@ -122,6 +213,14 @@ def main() -> int:
     parser.add_argument("--mcts_games_per_episode", type=int, default=4)
     parser.add_argument("--mcts_sims_training", type=int, default=100)
     parser.add_argument("--mcts_sims_final", type=int, default=300)
+
+    parser.add_argument("--parallel", action="store_true",
+                        help="Run each method as its own subprocess (one per GPU).")
+    parser.add_argument("--gpus", default="",
+                        help="Comma-separated GPU ids for --parallel (e.g. '0,1'). "
+                             "Round-robin assigned to methods. Empty = no GPU pinning.")
+    parser.add_argument("--single_method", action="store_true",
+                        help=argparse.SUPPRESS)  # internal: writes placements.json then exits
 
     args = parser.parse_args()
 
@@ -148,19 +247,61 @@ def main() -> int:
 
     os.makedirs(args.output_dir, exist_ok=True)
     methods = [m.strip().lower() for m in args.methods.split(",") if m.strip()]
+
+    # Single-method worker mode (used by --parallel parent): run, persist, exit.
+    if args.single_method:
+        if len(methods) != 1:
+            log.error(f"--single_method expects exactly one method, got {methods}")
+            return 1
+        name = methods[0]
+        placements = _run_one_method(name, args, tubes, video_length, log)
+        method_dir = os.path.join(args.output_dir, name)
+        _save_placements(method_dir, placements)
+        log.info(f"Wrote {_placements_path(method_dir)}")
+        return 0
+
     placements_per_method: Dict[str, Dict[int, float]] = {}
 
-    for name in methods:
-        pretty = _PRETTY_NAME.get(name, name)
-        log.info(f"=== Running {pretty} ===")
-        method_dir = os.path.join(args.output_dir, name)
-        os.makedirs(method_dir, exist_ok=True)
-        optimizer = _build_optimizer(name, method_dir, args)
-        t0 = time.time()
-        placements = optimizer.optimize(tubes, video_length)
-        elapsed = time.time() - t0
-        log.info(f"{pretty} finished in {elapsed:.1f}s with {len(placements)} placements")
-        placements_per_method[pretty] = placements
+    if args.parallel:
+        gpu_ids = _parse_gpus(args.gpus) if args.gpus else []
+        if gpu_ids:
+            log.info(f"Parallel mode: round-robin GPU assignment over {gpu_ids}")
+        else:
+            log.info("Parallel mode: no GPU pinning (CUDA_VISIBLE_DEVICES untouched)")
+
+        procs: List[Tuple[str, subprocess.Popen]] = []
+        for i, name in enumerate(methods):
+            gpu = gpu_ids[i % len(gpu_ids)] if gpu_ids else None
+            procs.append((name, _spawn_subprocess(name, gpu, args, log)))
+
+        failed: List[str] = []
+        for name, proc in procs:
+            ret = proc.wait()
+            if ret != 0:
+                log.error(f"{name} subprocess exited with code {ret} "
+                          f"(see {os.path.join(args.output_dir, name, 'stdout.log')})")
+                failed.append(name)
+            else:
+                log.info(f"{name} subprocess done")
+
+        for name in methods:
+            if name in failed:
+                continue
+            method_dir = os.path.join(args.output_dir, name)
+            placements = _load_placements(method_dir)
+            if placements is None:
+                log.warning(f"{name}: placements.json missing, skipping in comparison plot")
+                continue
+            placements_per_method[_PRETTY_NAME.get(name, name)] = placements
+    else:
+        for name in methods:
+            placements_per_method[_PRETTY_NAME.get(name, name)] = (
+                _run_one_method(name, args, tubes, video_length, log)
+            )
+
+    if not placements_per_method:
+        log.error("No method produced placements — nothing to plot.")
+        return 1
 
     comparison_path = os.path.join(args.output_dir, "methods_comparison.png")
     save_methods_comparison(tubes, placements_per_method, comparison_path)
