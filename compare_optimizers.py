@@ -133,8 +133,8 @@ def _run_one_method(
     video_length: int,
     fps: float,
     log: logging.Logger,
-) -> Dict[int, float]:
-    """Run a single optimizer in-process and return placements."""
+) -> Tuple[Dict[int, float], float]:
+    """Run a single optimizer in-process and return (placements, elapsed_seconds)."""
     pretty = _PRETTY_NAME.get(name, name)
     log.info(f"=== Running {pretty} ===")
     method_dir = os.path.join(args.output_dir, name)
@@ -144,7 +144,7 @@ def _run_one_method(
     placements = optimizer.optimize(tubes, video_length)
     elapsed = time.time() - t0
     log.info(f"{pretty} finished in {elapsed:.1f}s with {len(placements)} placements")
-    return placements
+    return placements, elapsed
 
 
 def _spawn_subprocess(
@@ -189,18 +189,27 @@ def _spawn_subprocess(
     return subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT, env=env)
 
 
-def _save_placements(method_dir: str, placements: Dict[int, float]) -> None:
+def _save_placements(method_dir: str, placements: Dict[int, float], elapsed: float) -> None:
+    payload = {
+        "placements": {str(k): float(v) for k, v in placements.items()},
+        "elapsed_seconds": float(elapsed),
+    }
     with open(_placements_path(method_dir), "w") as f:
-        json.dump({str(k): float(v) for k, v in placements.items()}, f)
+        json.dump(payload, f)
 
 
-def _load_placements(method_dir: str) -> Optional[Dict[int, float]]:
+def _load_placements(method_dir: str) -> Optional[Tuple[Dict[int, float], Optional[float]]]:
     p = _placements_path(method_dir)
     if not os.path.exists(p):
         return None
     with open(p) as f:
         raw = json.load(f)
-    return {int(k): float(v) for k, v in raw.items()}
+    # Back-compat: old format was a flat {tid: start} dict.
+    if "placements" in raw:
+        placements = {int(k): float(v) for k, v in raw["placements"].items()}
+        elapsed = raw.get("elapsed_seconds")
+        return placements, (float(elapsed) if elapsed is not None else None)
+    return {int(k): float(v) for k, v in raw.items()}, None
 
 
 def _parse_gpus(spec: str) -> List[int]:
@@ -278,13 +287,15 @@ def main() -> int:
             log.error(f"--single_method expects exactly one method, got {methods}")
             return 1
         name = methods[0]
-        placements = _run_one_method(name, args, tubes, video_length, fps, log)
+        placements, elapsed = _run_one_method(name, args, tubes, video_length, fps, log)
         method_dir = os.path.join(args.output_dir, name)
-        _save_placements(method_dir, placements)
-        log.info(f"Wrote {_placements_path(method_dir)}")
+        _save_placements(method_dir, placements, elapsed)
+        log.info(f"Wrote {_placements_path(method_dir)} (elapsed {elapsed:.1f}s)")
         return 0
 
     placements_per_method: Dict[str, Dict[int, float]] = {}
+    times_per_method: Dict[str, float] = {}
+    parallel_t0 = time.time()
 
     if args.parallel:
         gpu_ids = _parse_gpus(args.gpus) if args.gpus else []
@@ -312,23 +323,30 @@ def main() -> int:
             if name in failed:
                 continue
             method_dir = os.path.join(args.output_dir, name)
-            placements = _load_placements(method_dir)
-            if placements is None:
+            loaded = _load_placements(method_dir)
+            if loaded is None:
                 log.warning(f"{name}: placements.json missing, skipping in comparison plot")
                 continue
-            placements_per_method[_PRETTY_NAME.get(name, name)] = placements
+            placements, elapsed = loaded
+            pretty = _PRETTY_NAME.get(name, name)
+            placements_per_method[pretty] = placements
+            if elapsed is not None:
+                times_per_method[pretty] = elapsed
     else:
         for name in methods:
-            placements_per_method[_PRETTY_NAME.get(name, name)] = (
-                _run_one_method(name, args, tubes, video_length, fps, log)
-            )
+            placements, elapsed = _run_one_method(name, args, tubes, video_length, fps, log)
+            pretty = _PRETTY_NAME.get(name, name)
+            placements_per_method[pretty] = placements
+            times_per_method[pretty] = elapsed
 
     if not placements_per_method:
         log.error("No method produced placements — nothing to plot.")
         return 1
 
+    log.info(f"All methods done in {time.time() - parallel_t0:.1f}s wall-clock")
     comparison_path = os.path.join(args.output_dir, "methods_comparison.png")
-    save_methods_comparison(tubes, placements_per_method, comparison_path)
+    save_methods_comparison(tubes, placements_per_method, comparison_path,
+                            times_per_method=times_per_method)
     log.info(f"Done. Comparison plot: {comparison_path}")
     return 0
 

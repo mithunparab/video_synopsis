@@ -93,11 +93,13 @@ def save_methods_comparison(
     tubes: Dict[int, Tube],
     placements_per_method: Dict[str, Dict[int, float]],
     output_path: str,
+    times_per_method: Optional[Dict[str, float]] = None,
 ) -> None:
     """Save a single figure comparing the original arrangement against each method.
 
     One subplot per method, plus a leading "Initial" panel. Layout adapts to the
-    number of methods (up to 3 columns).
+    number of methods (up to 3 columns). When ``times_per_method`` is provided,
+    each panel title also reports the wall-clock time the optimizer took.
     """
     if not placements_per_method:
         log.warning("No methods to compare — skipping comparison plot.")
@@ -120,7 +122,11 @@ def save_methods_comparison(
             ax = fig.add_subplot(nrows, ncols, idx, projection="3d")
             placements = placements_per_method[name]
             synopsis_len = _synopsis_length(tubes, placements)
-            title = f"{name}  (synopsis: {synopsis_len:.1f}s)"
+            elapsed = (times_per_method or {}).get(name)
+            title_bits = [f"{name}", f"synopsis: {synopsis_len:.1f}s"]
+            if elapsed is not None:
+                title_bits.append(_fmt_elapsed(elapsed))
+            title = "  •  ".join(title_bits)
             _scatter_arrangement(ax, tubes, placements, title, show_legend=False)
 
         plt.tight_layout(rect=(0, 0, 1, 0.96))
@@ -129,6 +135,16 @@ def save_methods_comparison(
         log.info(f"Comparison plot saved to {output_path}")
     except Exception as e:
         log.warning(f"Failed to save comparison plot: {e}")
+
+
+def _fmt_elapsed(secs: float) -> str:
+    if secs < 60:
+        return f"{secs:.1f}s"
+    m, s = divmod(int(secs), 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
 
 
 def _synopsis_length(tubes: Dict[int, Tube], placements: Dict[int, float]) -> float:

@@ -11,6 +11,7 @@ from typing import Dict
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from video_synopsis.data.types import Tube
 from video_synopsis.optimization.base import BaseOptimizer
@@ -110,7 +111,8 @@ class EnergyOptimizer(BaseOptimizer):
         # row 0 = baseline, rows 1..N = +eps on dim k, rows N+1..2N = -eps on dim k.
         eye = torch.eye(n, device=device, dtype=batch.dtype) * eps
 
-        for epoch in range(self.epochs):
+        pbar = tqdm(range(self.epochs), desc="Energy", unit="ep")
+        for epoch in pbar:
             perturb = torch.cat(
                 [starts.unsqueeze(0), starts.unsqueeze(0) + eye, starts.unsqueeze(0) - eye],
                 dim=0,
@@ -144,14 +146,13 @@ class EnergyOptimizer(BaseOptimizer):
             if (epoch + 1) % 500 == 0:
                 lr *= 0.8
 
-            if (epoch + 1) % 200 == 0:
-                synopsis_len = float(
-                    (starts + batch.durations).max().item()
-                )
-                log.info(
-                    f"Epoch {epoch+1}/{self.epochs}, Energy: {energy_val:.4f}, "
-                    f"Best: {best_energy:.4f}, Synopsis: {synopsis_len:.1f}s"
-                )
+            if (epoch + 1) % 50 == 0:
+                synopsis_len = float((starts + batch.durations).max().item())
+                pbar.set_postfix({
+                    "E": f"{energy_val:.1f}",
+                    "best": f"{best_energy:.1f}",
+                    "syn": f"{synopsis_len:.1f}s",
+                })
 
         best_np = best_starts.detach().cpu().numpy()
         result = {tid: float(best_np[i]) for i, tid in enumerate(tube_ids)}

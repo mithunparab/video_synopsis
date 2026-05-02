@@ -10,6 +10,7 @@ import os
 from typing import Dict
 
 import torch
+from tqdm import tqdm
 
 from video_synopsis.data.types import Tube
 from video_synopsis.optimization.base import BaseOptimizer
@@ -110,7 +111,8 @@ class PSOOptimizer(BaseOptimizer):
         global_best_pos = positions[0].clone()
         global_best_fit = torch.tensor(float("inf"), device=device, dtype=batch.dtype)
 
-        for iteration in range(self.max_iterations):
+        pbar = tqdm(range(self.max_iterations), desc="PSO", unit="it")
+        for iteration in pbar:
             w_current = self.w - (self.w - 0.4) * iteration / max(1, self.max_iterations - 1)
 
             fitness = compute_energy_torch(
@@ -145,11 +147,8 @@ class PSOOptimizer(BaseOptimizer):
             positions = positions + velocities
             positions = torch.minimum(torch.maximum(positions, lower.unsqueeze(0)), upper.unsqueeze(0))
 
-            if (iteration + 1) % 50 == 0:
-                log.info(
-                    f"PSO iteration {iteration + 1}/{self.max_iterations}, "
-                    f"best energy: {float(global_best_fit.item()):.4f}"
-                )
+            if (iteration + 1) % 10 == 0:
+                pbar.set_postfix({"best": f"{float(global_best_fit.item()):.1f}"})
 
         best_np = global_best_pos.detach().cpu().numpy()
         result = {tid: float(best_np[i]) for i, tid in enumerate(tube_ids)}

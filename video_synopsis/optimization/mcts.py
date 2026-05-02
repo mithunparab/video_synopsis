@@ -474,7 +474,8 @@ class MCTSOptimizer(BaseOptimizer):
         placements: Dict[int, float] = {}
         remaining = list(tubes.keys())
 
-        for i in range(num_tubes):
+        pbar = tqdm(range(num_tubes), desc="MCTS placing", unit="tube")
+        for _ in pbar:
             if not remaining:
                 break
             root = MCTSNode(
@@ -501,7 +502,7 @@ class MCTSOptimizer(BaseOptimizer):
             action = best.action_taken
             placements[action] = best.placed_tubes[action]
             remaining.remove(action)
-            log.info(f"Placed tube {action} at {placements[action]:.2f}s")
+            pbar.set_postfix({"tid": action, "t": f"{placements[action]:.1f}s"})
 
         # Handle unplaced tubes
         if remaining:
