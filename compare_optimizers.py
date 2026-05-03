@@ -87,6 +87,7 @@ def _build_optimizer(name: str, output_dir: str, args, fps: float):
             epochs=args.energy_epochs,
             collision_method=args.collision_method,
             sigma=args.sigma,
+            radius=args.collision_radius,
             output_dir=output_dir,
             fps=fps,
         )
@@ -97,6 +98,7 @@ def _build_optimizer(name: str, output_dir: str, args, fps: float):
             max_iterations=args.pso_max_iterations,
             collision_method=args.collision_method,
             sigma=args.sigma,
+            radius=args.collision_radius,
             output_dir=output_dir,
             fps=fps,
         )
@@ -109,6 +111,7 @@ def _build_optimizer(name: str, output_dir: str, args, fps: float):
             mcts_sims_final=args.mcts_sims_final,
             collision_method=args.collision_method,
             sigma=args.sigma,
+            radius=args.collision_radius,
             output_dir=output_dir,
             fps=fps,
         )
@@ -167,6 +170,7 @@ def _spawn_subprocess(
         "--fps", str(args.fps),
         "--collision_method", args.collision_method,
         "--sigma", str(args.sigma),
+        "--collision_radius", str(args.collision_radius),
         "--energy_epochs", str(args.energy_epochs),
         "--pso_num_particles", str(args.pso_num_particles),
         "--pso_max_iterations", str(args.pso_max_iterations),
@@ -228,9 +232,14 @@ def main() -> int:
                         help="Override the timeline length (frames). "
                              "Default: read metadata.json (augmented sets) or infer from tube frame indices.")
 
-    parser.add_argument("--collision_method", default="iou",
-                        help="iou (default, true overlap only) | repulsion (smooth proximity tax).")
-    parser.add_argument("--sigma", type=float, default=50.0)
+    parser.add_argument("--collision_method", default="centroid",
+                        help="centroid (default, hinge on centroid distance) | "
+                             "iou (true overlap only) | repulsion (smooth proximity tax everywhere).")
+    parser.add_argument("--sigma", type=float, default=50.0,
+                        help="Repulsion softness (only used by --collision_method repulsion).")
+    parser.add_argument("--collision_radius", type=float, default=30.0,
+                        help="Centroid-distance cutoff in pixels (only used by --collision_method centroid). "
+                             "Pairs farther than this contribute zero collision cost.")
     parser.add_argument("--fps", type=float, default=0.0,
                         help="FPS for converting video_length_frames -> seconds. "
                              "Default: read metadata.json or fall back to 30.")

@@ -37,10 +37,11 @@ class EnergyOptimizer(BaseOptimizer):
         self,
         epochs: int = 2000,
         lr: float = 0.1,
-        collision_method: str = "iou",
+        collision_method: str = "centroid",
         sigma: float = 50.0,
+        radius: float = 30.0,
         w_duration: float = 1.0,
-        w_collision: float = 1000.0,
+        w_collision: float = 10.0,
         w_activity: float = 10.0,
         sample_step: int = 1,
         output_dir: str = "optimized_tubes_energy",
@@ -52,6 +53,7 @@ class EnergyOptimizer(BaseOptimizer):
         self.lr = lr
         self.collision_method = collision_method
         self.sigma = sigma
+        self.radius = radius
         self.w_duration = w_duration
         self.w_collision = w_collision
         self.w_activity = w_activity
@@ -125,6 +127,7 @@ class EnergyOptimizer(BaseOptimizer):
                 w_activity=self.w_activity,
                 method=self.collision_method,
                 sigma=self.sigma,
+                radius=self.radius,
                 video_length=float(target_duration),
                 sample_count=sample_count,
                 chunk_size=self.chunk_size,

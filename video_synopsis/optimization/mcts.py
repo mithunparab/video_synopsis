@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 from video_synopsis.data.types import Tube
 from video_synopsis.optimization.base import BaseOptimizer
-from video_synopsis.optimization.collision import compute_energy
+from video_synopsis.optimization.collision import compute_energy, compute_pairwise_collision_3d
 from video_synopsis.optimization.visualize import save_initial_vs_optimized
 
 log = logging.getLogger(__name__)
@@ -66,11 +66,13 @@ class MCTSNode:
         model: Optional[TubeNet] = None,
         size: Tuple[int, int] = (1920, 1080),
         device: str = "cpu",
-        collision_method: str = "repulsion",
+        collision_method: str = "centroid",
         sigma: float = 50.0,
+        radius: float = 30.0,
         c_puct: float = 1.4,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
+        slot_tolerance: float = 0.5,
     ) -> None:
         self.placed_tubes = placed_tubes
         self.remaining_tubes = remaining_tubes
@@ -87,7 +89,9 @@ class MCTSNode:
         self.video_width, self.video_height = size
         self.collision_method = collision_method
         self.sigma = sigma
+        self.radius = radius
         self.c_puct = c_puct
+        self.slot_tolerance = slot_tolerance
         self.prior_probs: Dict[int, float] = {}
         self.untried_actions = self.remaining_tubes.copy()
 
@@ -169,7 +173,9 @@ class MCTSNode:
             device=self.device,
             collision_method=self.collision_method,
             sigma=self.sigma,
+            radius=self.radius,
             c_puct=self.c_puct,
+            slot_tolerance=self.slot_tolerance,
         )
         self.children.append(child)
         return child
@@ -177,62 +183,54 @@ class MCTSNode:
     def _find_earliest_start_time(
         self, tube_id: int, placements: Optional[Dict[int, float]] = None
     ) -> float:
+        """Earliest start whose per-frame centroid collision is below tolerance.
+
+        Old behavior used a union-bbox intersection as the gate: if any placed
+        tube's union-bbox touched this tube's union-bbox, the placed tube's
+        whole interval was forbidden. That over-blocked: two pedestrians on
+        the same walkway have overlapping union-bboxes, but at any single
+        moment they're typically far apart on the path.
+
+        New behavior: scan candidate starts (0 and right after each placed
+        tube ends), and for each candidate compute per-frame collision against
+        every placed tube using the same metric the reward uses. Accept the
+        first candidate whose total collision is below ``slot_tolerance``.
+        """
         current = placements if placements is not None else self.placed_tubes
         tube = self.tubes[tube_id]
         duration = tube.duration
+        max_start = max(0.0, self.total_seconds - duration)
 
-        slots: List[Tuple[float, float]] = [(0.0, float(self.total_seconds))]
+        if not current:
+            return 0.0
 
-        for placed_id, placed_start in current.items():
-            placed_tube = self.tubes[placed_id]
-            # Use per-frame collision check to see if spatial overlap exists
-            # Quick check: if union bboxes don't overlap, skip
-            union_i = tube.union_bbox()
-            union_j = placed_tube.union_bbox()
-            x1 = max(union_i[0], union_j[0])
-            y1 = max(union_i[1], union_j[1])
-            x2 = min(union_i[2], union_j[2])
-            y2 = min(union_i[3], union_j[3])
-            if x2 <= x1 or y2 <= y1:
-                continue  # No spatial overlap possible
+        candidates: List[float] = [0.0]
+        for tid, st in current.items():
+            candidates.append(st + self.tubes[tid].duration)
+        candidates = sorted(set(c for c in candidates if c <= max_start + 1e-6))
 
-            placed_duration = placed_tube.duration
-            placed_end = placed_start + placed_duration
+        # Sample every 4th frame for the slot-screening collision call —
+        # cheap enough that we can do this for every (tube, candidate, placed)
+        # triple. The reward function still uses sample_step=1 for the final
+        # objective, so the search is exact at terminal nodes.
+        for cand in candidates:
+            cost = 0.0
+            for tid, st in current.items():
+                cost += compute_pairwise_collision_3d(
+                    tube, cand, self.tubes[tid], st,
+                    method=self.collision_method,
+                    sigma=self.sigma,
+                    radius=self.radius,
+                    sample_step=4,
+                )
+                if cost > self.slot_tolerance:
+                    break
+            if cost <= self.slot_tolerance:
+                return min(cand, max_start)
 
-            new_slots = []
-            for s, e in slots:
-                if placed_end <= s or placed_start >= e:
-                    new_slots.append((s, e))
-                else:
-                    if s < placed_start:
-                        new_slots.append((s, placed_start))
-                    if e > placed_end:
-                        new_slots.append((placed_end, e))
-            slots = new_slots
-
-        slots.sort()
-        # Merge adjacent/overlapping slots
-        if len(slots) > 1:
-            merged = [slots[0]]
-            for s, e in slots[1:]:
-                ps, pe = merged[-1]
-                if s <= pe:
-                    merged[-1] = (ps, max(pe, e))
-                else:
-                    merged.append((s, e))
-            slots = merged
-
-        for s, e in slots:
-            if (e - s) >= duration:
-                return min(s, max(0.0, self.total_seconds - duration))
-
-        # Fallback: place after all existing
-        latest_end = 0.0
-        if current:
-            latest_end = max(
-                ps + self.tubes[tid].duration for tid, ps in current.items()
-            )
-        return max(0.0, min(latest_end, self.total_seconds - duration))
+        # Nothing fits cleanly — append at the latest end.
+        latest_end = max(st + self.tubes[tid].duration for tid, st in current.items())
+        return max(0.0, min(latest_end, max_start))
 
     def _create_input_vector(self) -> torch.Tensor:
         features: List[float] = []
@@ -257,7 +255,9 @@ class MCTSNode:
         """Compute reward using corrected per-frame 3D collision.
 
         Weights match Energy / PSO so all three optimizers minimize the same
-        objective: collision-strict (IoU) compression.
+        objective. Default metric is centroid-distance hinge — pairs farther
+        than ``radius`` pixels apart are free, so the optimizer can pack
+        spatially-disjoint tubes in parallel.
         """
         if not self.placed_tubes:
             return 0.0
@@ -265,10 +265,11 @@ class MCTSNode:
             self.tubes,
             self.placed_tubes,
             w_duration=1.0,
-            w_collision=1000.0,
+            w_collision=10.0,
             w_activity=10.0,
             method=self.collision_method,
             sigma=self.sigma,
+            radius=self.radius,
             video_length=float(self.total_seconds),
             sample_step=1,
         )
@@ -316,11 +317,13 @@ def _self_play_episode(
     device: str,
     collision_method: str,
     sigma: float,
+    radius: float,
     mcts_sims: int,
     video_size: Tuple[int, int],
     c_puct: float,
     dirichlet_alpha: float,
     dirichlet_epsilon: float,
+    slot_tolerance: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     root = MCTSNode(
         placed_tubes={},
@@ -331,10 +334,12 @@ def _self_play_episode(
         device=device,
         collision_method=collision_method,
         sigma=sigma,
+        radius=radius,
         size=video_size,
         c_puct=c_puct,
         dirichlet_alpha=dirichlet_alpha,
         dirichlet_epsilon=dirichlet_epsilon,
+        slot_tolerance=slot_tolerance,
     )
     mcts_search(root, num_simulations=mcts_sims)
 
@@ -400,8 +405,10 @@ class MCTSOptimizer(BaseOptimizer):
         training_epochs: int = 5,
         batch_size: int = 32,
         lr: float = 0.001,
-        collision_method: str = "iou",
+        collision_method: str = "centroid",
         sigma: float = 50.0,
+        radius: float = 30.0,
+        slot_tolerance: float = 0.5,
         c_puct: float = 1.4,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
@@ -418,6 +425,8 @@ class MCTSOptimizer(BaseOptimizer):
         self.lr = lr
         self.collision_method = collision_method
         self.sigma = sigma
+        self.radius = radius
+        self.slot_tolerance = slot_tolerance
         self.c_puct = c_puct
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
@@ -461,9 +470,10 @@ class MCTSOptimizer(BaseOptimizer):
             for _ in tqdm(range(self.games_per_episode), desc=f"Games Ep.{episode+1}"):
                 data = _self_play_episode(
                     model, tubes, search_horizon, device,
-                    self.collision_method, self.sigma,
+                    self.collision_method, self.sigma, self.radius,
                     self.mcts_sims_training, self.video_size,
                     self.c_puct, self.dirichlet_alpha, self.dirichlet_epsilon,
+                    self.slot_tolerance,
                 )
                 all_data.append(data)
             _train_model(model, opt, all_data, self.training_epochs, self.batch_size, device)
@@ -487,10 +497,12 @@ class MCTSOptimizer(BaseOptimizer):
                 device=device,
                 collision_method=self.collision_method,
                 sigma=self.sigma,
+                radius=self.radius,
                 size=self.video_size,
                 c_puct=self.c_puct,
                 dirichlet_alpha=0.0,
                 dirichlet_epsilon=0.0,
+                slot_tolerance=self.slot_tolerance,
             )
             mcts_search(root, num_simulations=self.mcts_sims_final)
 
@@ -514,6 +526,10 @@ class MCTSOptimizer(BaseOptimizer):
                 total_seconds=search_horizon,
                 model=None,
                 device="cpu",
+                collision_method=self.collision_method,
+                sigma=self.sigma,
+                radius=self.radius,
+                slot_tolerance=self.slot_tolerance,
             )
             for tid in remaining:
                 start = temp._find_earliest_start_time(tid, placements)

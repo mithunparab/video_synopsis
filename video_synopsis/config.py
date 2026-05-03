@@ -43,8 +43,9 @@ class Config:
     energy_optimization: bool = True
     optimizer: str = "energy"  # "energy", "mcts", or "pso"
     epochs: int = 2000
-    collision_method: str = "repulsion"
+    collision_method: str = "centroid"
     sigma: float = 50.0
+    collision_radius: float = 30.0
 
     # MCTS-specific
     mcts_training_episodes: int = 10
@@ -134,6 +135,7 @@ class Config:
         parser.add_argument("--epochs", type=int, default=cls.epochs)
         parser.add_argument("--collision_method", type=str, default=cls.collision_method)
         parser.add_argument("--sigma", type=float, default=cls.sigma)
+        parser.add_argument("--collision_radius", type=float, default=cls.collision_radius)
 
         parser.add_argument("--mcts_training_episodes", type=int, default=cls.mcts_training_episodes)
         parser.add_argument("--mcts_games_per_episode", type=int, default=cls.mcts_games_per_episode)

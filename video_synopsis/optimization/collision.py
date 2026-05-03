@@ -58,6 +58,29 @@ def _bbox_repulsion(a: np.ndarray, b: np.ndarray, sigma: float = 50.0) -> float:
     return 1.0 / (dist_sq / (sigma ** 2 + 1e-6) + 1.0)
 
 
+def _bbox_centroid_dist(a: np.ndarray, b: np.ndarray, radius: float = 30.0) -> float:
+    """Smooth hinge on centroid distance: 1 - dist/R for dist < R, else 0.
+
+    Pairs further than ``radius`` pixels apart contribute zero — they can run
+    in parallel for free, even if their bounding boxes graze. Inside ``radius``
+    the cost is linear in distance, giving gradient methods a usable signal.
+    """
+    cx_a = (a[0] + a[2]) / 2
+    cy_a = (a[1] + a[3]) / 2
+    cx_b = (b[0] + b[2]) / 2
+    cy_b = (b[1] + b[3]) / 2
+    dist = float(np.sqrt((cx_a - cx_b) ** 2 + (cy_a - cy_b) ** 2))
+    return max(0.0, 1.0 - dist / max(radius, 1e-6))
+
+
+def _spatial_fn_np(method: str, sigma: float, radius: float):
+    if method == "iou":
+        return _bbox_iou
+    if method == "centroid":
+        return lambda a, b: _bbox_centroid_dist(a, b, radius)
+    return lambda a, b: _bbox_repulsion(a, b, sigma)
+
+
 def compute_pairwise_collision_3d(
     tube_i: Tube,
     start_i: float,
@@ -65,30 +88,23 @@ def compute_pairwise_collision_3d(
     start_j: float,
     method: str = "repulsion",
     sigma: float = 50.0,
+    radius: float = 30.0,
     sample_step: int = 1,
 ) -> float:
     """Compute collision energy between two tubes at their optimized start times.
-
-    This is the corrected version that uses **per-frame bounding boxes**
-    instead of static union boxes.
 
     Algorithm:
         1. Shift each tube's timestamps by its optimized start time.
         2. Find the temporal overlap window.
         3. For overlapping frames, find nearest-neighbor bbox in each tube.
-        4. Sum the spatial metric (IoU or repulsion) across overlap frames.
+        4. Sum the spatial metric across overlap frames.
 
-    Args:
-        tube_i: First tube.
-        start_i: Optimized start time for tube_i.
-        tube_j: Second tube.
-        start_j: Optimized start time for tube_j.
-        method: 'iou' or 'repulsion'.
-        sigma: Sigma for repulsion energy.
-        sample_step: Sample every N-th overlapping frame (for speed).
-
-    Returns:
-        Total collision energy for this pair.
+    ``method``:
+        * ``iou`` — bounding-box IoU (binary-feeling penalty).
+        * ``repulsion`` — smooth ``1/(1+d²/σ²)`` proximity tax everywhere.
+        * ``centroid`` — hinge ``max(0, 1 − d/R)``: zero when farther than R,
+          linear inside R. Lets spatially-disjoint tubes overlap in time for
+          free, while still strongly penalising true overlap.
     """
     if tube_i.num_frames == 0 or tube_j.num_frames == 0:
         return 0.0
@@ -107,11 +123,11 @@ def compute_pairwise_collision_3d(
 
     bboxes_i = tube_i.bboxes_array
     bboxes_j = tube_j.bboxes_array
+    spatial_fn = _spatial_fn_np(method, sigma, radius)
 
     if overlap_end == overlap_start:
         idx_i = int(np.argmin(np.abs(shifted_i - overlap_start)))
         idx_j = int(np.argmin(np.abs(shifted_j - overlap_start)))
-        spatial_fn = _bbox_iou if method == "iou" else lambda a, b: _bbox_repulsion(a, b, sigma)
         return spatial_fn(bboxes_i[idx_i], bboxes_j[idx_j])
 
     dt_i = np.diff(shifted_i).mean() if len(shifted_i) > 1 else 1.0
@@ -124,8 +140,6 @@ def compute_pairwise_collision_3d(
     sample_times = np.linspace(overlap_start, overlap_end, num_samples)
     if sample_step > 1:
         sample_times = sample_times[::sample_step]
-
-    spatial_fn = _bbox_iou if method == "iou" else lambda a, b: _bbox_repulsion(a, b, sigma)
 
     total_collision = 0.0
     for t in sample_times:
@@ -141,6 +155,7 @@ def compute_total_collision_3d(
     starts: dict,
     method: str = "repulsion",
     sigma: float = 50.0,
+    radius: float = 30.0,
     sample_step: int = 1,
 ) -> float:
     """Sum pairwise 3D collision over all tube pairs."""
@@ -155,6 +170,7 @@ def compute_total_collision_3d(
                     tubes[tj], starts[tj],
                     method=method,
                     sigma=sigma,
+                    radius=radius,
                     sample_step=sample_step,
                 )
     return total
@@ -168,6 +184,7 @@ def compute_energy(
     w_activity: float = 0.1,
     method: str = "repulsion",
     sigma: float = 50.0,
+    radius: float = 30.0,
     video_length: float = 0.0,
     sample_step: int = 1,
 ) -> float:
@@ -183,7 +200,7 @@ def compute_energy(
     e_duration = max_end
 
     e_collision = compute_total_collision_3d(
-        tubes, starts, method=method, sigma=sigma, sample_step=sample_step
+        tubes, starts, method=method, sigma=sigma, radius=radius, sample_step=sample_step
     )
 
     e_activity = 0.0
@@ -291,6 +308,16 @@ def _bbox_repulsion_batched(a: torch.Tensor, b: torch.Tensor, sigma: float) -> t
     return 1.0 / (dist_sq / (sigma ** 2 + 1e-6) + 1.0)
 
 
+def _bbox_centroid_dist_batched(a: torch.Tensor, b: torch.Tensor, radius: float) -> torch.Tensor:
+    """Hinge on centroid distance: 1 - dist/R inside R, else 0. See ``_bbox_centroid_dist``."""
+    cx_a = (a[..., 0] + a[..., 2]) / 2
+    cy_a = (a[..., 1] + a[..., 3]) / 2
+    cx_b = (b[..., 0] + b[..., 2]) / 2
+    cy_b = (b[..., 1] + b[..., 3]) / 2
+    dist = torch.sqrt((cx_a - cx_b) ** 2 + (cy_a - cy_b) ** 2 + 1e-9)
+    return (1.0 - dist / max(float(radius), 1e-6)).clamp(min=0.0)
+
+
 def _gather_nearest(
     rel_ts: torch.Tensor,         # [P, T_max] sorted ascending, padded with last value
     bboxes: torch.Tensor,         # [P, T_max, 4]
@@ -338,6 +365,7 @@ def _collision_chunk(
     valid_pair: torch.Tensor, # [P] bool
     method: str,
     sigma: float,
+    radius: float,
     K: int,
 ) -> torch.Tensor:
     """Inner batched kernel; all P-major tensors are precomputed."""
@@ -364,6 +392,8 @@ def _collision_chunk(
 
     if method == "iou":
         e = _bbox_iou_batched(bbox_a_at_t, bbox_b_at_t)
+    elif method == "centroid":
+        e = _bbox_centroid_dist_batched(bbox_a_at_t, bbox_b_at_t, radius)
     else:
         e = _bbox_repulsion_batched(bbox_a_at_t, bbox_b_at_t, sigma)
 
@@ -377,6 +407,7 @@ def compute_collision_energy_torch(
     starts: torch.Tensor,
     method: str = "repulsion",
     sigma: float = 50.0,
+    radius: float = 30.0,
     sample_count: int = 32,
     chunk_size: int = 32,
 ) -> torch.Tensor:
@@ -421,7 +452,7 @@ def compute_collision_energy_torch(
             starts_b, pair_i, pair_j,
             bboxes_a, bboxes_b, rel_ts_a, rel_ts_b,
             last_idx_a, last_idx_b, max_rel_a, max_rel_b, valid_pair,
-            method, sigma, K,
+            method, sigma, radius, K,
         )
     else:
         parts = []
@@ -430,7 +461,7 @@ def compute_collision_energy_torch(
                 starts_b[s:s + chunk], pair_i, pair_j,
                 bboxes_a, bboxes_b, rel_ts_a, rel_ts_b,
                 last_idx_a, last_idx_b, max_rel_a, max_rel_b, valid_pair,
-                method, sigma, K,
+                method, sigma, radius, K,
             ))
         out = torch.cat(parts, dim=0)
 
@@ -445,6 +476,7 @@ def compute_energy_torch(
     w_activity: float = 0.1,
     method: str = "repulsion",
     sigma: float = 50.0,
+    radius: float = 30.0,
     video_length: float = 0.0,
     sample_count: int = 32,
     chunk_size: int = 32,
@@ -465,7 +497,7 @@ def compute_energy_torch(
     e_duration = ends.max(dim=-1).values                          # [B]
 
     e_collision = compute_collision_energy_torch(
-        batch, starts_b, method=method, sigma=sigma,
+        batch, starts_b, method=method, sigma=sigma, radius=radius,
         sample_count=sample_count, chunk_size=chunk_size,
     )
 

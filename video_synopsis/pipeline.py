@@ -141,6 +141,7 @@ class Pipeline:
                 epochs=cfg.epochs,
                 collision_method=cfg.collision_method,
                 sigma=cfg.sigma,
+                radius=cfg.collision_radius,
                 output_dir=cfg.optimized_tubes_dir,
                 fps=fps,
             )
@@ -154,6 +155,7 @@ class Pipeline:
                 c2=cfg.pso_social,
                 collision_method=cfg.collision_method,
                 sigma=cfg.sigma,
+                radius=cfg.collision_radius,
                 output_dir=cfg.optimized_tubes_dir,
                 fps=fps,
             )
@@ -167,6 +169,7 @@ class Pipeline:
                 lr=cfg.mcts_lr,
                 collision_method=cfg.collision_method,
                 sigma=cfg.sigma,
+                radius=cfg.collision_radius,
                 c_puct=cfg.mcts_c_puct,
                 output_dir=cfg.optimized_tubes_dir,
                 fps=fps,
