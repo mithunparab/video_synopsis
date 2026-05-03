@@ -112,16 +112,32 @@ def _build_optimizer(name: str, output_dir: str, args, fps: float):
             collision_method=args.collision_method,
             sigma=args.sigma,
             radius=args.collision_radius,
+            w_chronology=args.w_chronology,
             output_dir=output_dir,
             fps=fps,
         )
-    raise ValueError(f"Unknown optimizer: {name!r} (expected energy|pso|mcts)")
+    if name == "mcmc":
+        from video_synopsis.optimization.mcmc import MCMCOptimizer
+        return MCMCOptimizer(
+            num_chains=args.mcmc_chains,
+            num_steps=args.mcmc_steps,
+            proposal_std=args.mcmc_proposal_std,
+            global_jump_prob=args.mcmc_global_jump_prob,
+            collision_method=args.collision_method,
+            sigma=args.sigma,
+            radius=args.collision_radius,
+            w_chronology=args.w_chronology,
+            output_dir=output_dir,
+            fps=fps,
+        )
+    raise ValueError(f"Unknown optimizer: {name!r} (expected energy|pso|mcts|mcmc)")
 
 
 _PRETTY_NAME = {
     "energy": "Energy (gradient)",
     "pso": "PSO",
     "mcts": "MCTS+AlphaZero",
+    "mcmc": "MCMC (parallel chains)",
 }
 
 
@@ -171,6 +187,11 @@ def _spawn_subprocess(
         "--collision_method", args.collision_method,
         "--sigma", str(args.sigma),
         "--collision_radius", str(args.collision_radius),
+        "--w_chronology", str(args.w_chronology),
+        "--mcmc_chains", str(args.mcmc_chains),
+        "--mcmc_steps", str(args.mcmc_steps),
+        "--mcmc_proposal_std", str(args.mcmc_proposal_std),
+        "--mcmc_global_jump_prob", str(args.mcmc_global_jump_prob),
         "--energy_epochs", str(args.energy_epochs),
         "--pso_num_particles", str(args.pso_num_particles),
         "--pso_max_iterations", str(args.pso_max_iterations),
@@ -226,8 +247,8 @@ def main() -> int:
                         help="Directory containing tube_*.npz files produced by TubeArchive.save_all.")
     parser.add_argument("--output_dir", default="./comparison_out",
                         help="Where to write per-method plots and the combined comparison plot.")
-    parser.add_argument("--methods", default="energy,pso,mcts",
-                        help="Comma-separated subset of {energy,pso,mcts}.")
+    parser.add_argument("--methods", default="energy,pso,mcts,mcmc",
+                        help="Comma-separated subset of {energy,pso,mcts,mcmc}.")
     parser.add_argument("--video_length_frames", type=int, default=0,
                         help="Override the timeline length (frames). "
                              "Default: read metadata.json (augmented sets) or infer from tube frame indices.")
@@ -240,6 +261,20 @@ def main() -> int:
     parser.add_argument("--collision_radius", type=float, default=30.0,
                         help="Centroid-distance cutoff in pixels (only used by --collision_method centroid). "
                              "Pairs farther than this contribute zero collision cost.")
+    parser.add_argument("--w_chronology", type=float, default=0.0,
+                        help="Weight on chronology preservation (Nie et al. TIP 2019 Et term). "
+                             "Penalises synopsis-time inversions of pairs that were close in source. "
+                             "0 = disabled.")
+
+    parser.add_argument("--mcmc_chains", type=int, default=32,
+                        help="Number of parallel MCMC chains (each is a candidate placement).")
+    parser.add_argument("--mcmc_steps", type=int, default=50000,
+                        help="MCMC iterations per chain.")
+    parser.add_argument("--mcmc_proposal_std", type=float, default=5.0,
+                        help="Stddev of Gaussian proposal kernel in seconds.")
+    parser.add_argument("--mcmc_global_jump_prob", type=float, default=0.1,
+                        help="Probability of replacing the proposal with a uniform draw "
+                             "across the valid range (helps escape local minima).")
     parser.add_argument("--fps", type=float, default=0.0,
                         help="FPS for converting video_length_frames -> seconds. "
                              "Default: read metadata.json or fall back to 30.")

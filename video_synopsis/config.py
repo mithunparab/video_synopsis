@@ -41,11 +41,18 @@ class Config:
 
     # Optimization
     energy_optimization: bool = True
-    optimizer: str = "energy"  # "energy", "mcts", or "pso"
+    optimizer: str = "energy"  # "energy", "mcts", "pso", or "mcmc"
     epochs: int = 2000
     collision_method: str = "centroid"
     sigma: float = 50.0
     collision_radius: float = 30.0
+    w_chronology: float = 0.0
+
+    # MCMC-specific
+    mcmc_chains: int = 32
+    mcmc_steps: int = 50000
+    mcmc_proposal_std: float = 5.0
+    mcmc_global_jump_prob: float = 0.1
 
     # MCTS-specific
     mcts_training_episodes: int = 10
@@ -131,11 +138,16 @@ class Config:
 
         parser.add_argument("--energy_optimization", type=bool, default=cls.energy_optimization)
         parser.add_argument("--optimizer", type=str, default=cls.optimizer,
-                            choices=["mcts", "energy", "pso"])
+                            choices=["mcts", "energy", "pso", "mcmc"])
         parser.add_argument("--epochs", type=int, default=cls.epochs)
         parser.add_argument("--collision_method", type=str, default=cls.collision_method)
         parser.add_argument("--sigma", type=float, default=cls.sigma)
         parser.add_argument("--collision_radius", type=float, default=cls.collision_radius)
+        parser.add_argument("--w_chronology", type=float, default=cls.w_chronology)
+        parser.add_argument("--mcmc_chains", type=int, default=cls.mcmc_chains)
+        parser.add_argument("--mcmc_steps", type=int, default=cls.mcmc_steps)
+        parser.add_argument("--mcmc_proposal_std", type=float, default=cls.mcmc_proposal_std)
+        parser.add_argument("--mcmc_global_jump_prob", type=float, default=cls.mcmc_global_jump_prob)
 
         parser.add_argument("--mcts_training_episodes", type=int, default=cls.mcts_training_episodes)
         parser.add_argument("--mcts_games_per_episode", type=int, default=cls.mcts_games_per_episode)

@@ -17,6 +17,7 @@ from video_synopsis.data.types import Tube
 from video_synopsis.optimization.base import BaseOptimizer
 from video_synopsis.optimization.collision import (
     TubeBatch,
+    auto_tune_chronology_M,
     compute_energy_torch,
     pick_device,
 )
@@ -43,6 +44,7 @@ class EnergyOptimizer(BaseOptimizer):
         w_duration: float = 1.0,
         w_collision: float = 10.0,
         w_activity: float = 10.0,
+        w_chronology: float = 0.0,
         sample_step: int = 1,
         output_dir: str = "optimized_tubes_energy",
         device: str = "",
@@ -57,6 +59,7 @@ class EnergyOptimizer(BaseOptimizer):
         self.w_duration = w_duration
         self.w_collision = w_collision
         self.w_activity = w_activity
+        self.w_chronology = w_chronology
         self.sample_step = sample_step
         self.output_dir = output_dir
         self.device_pref = device
@@ -82,6 +85,9 @@ class EnergyOptimizer(BaseOptimizer):
 
         batch = TubeBatch(tubes, device=device)
         sample_count = max(8, 128 // max(self.sample_step, 1))
+        chronology_M = auto_tune_chronology_M(tubes) if self.w_chronology > 0 else 0.0
+        if self.w_chronology > 0:
+            log.info(f"Chronology weight: {self.w_chronology:.3f}, auto-tuned M: {chronology_M:.1f}s")
 
         # Initial placement: stagger tubes within target_duration so the
         # finite-diff gradient sees overlap from the start.
@@ -125,6 +131,8 @@ class EnergyOptimizer(BaseOptimizer):
                 w_duration=self.w_duration,
                 w_collision=self.w_collision,
                 w_activity=self.w_activity,
+                w_chronology=self.w_chronology,
+                chronology_M=chronology_M,
                 method=self.collision_method,
                 sigma=self.sigma,
                 radius=self.radius,

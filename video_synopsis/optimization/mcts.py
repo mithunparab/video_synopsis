@@ -18,7 +18,11 @@ from tqdm import tqdm
 
 from video_synopsis.data.types import Tube
 from video_synopsis.optimization.base import BaseOptimizer
-from video_synopsis.optimization.collision import compute_energy, compute_pairwise_collision_3d
+from video_synopsis.optimization.collision import (
+    auto_tune_chronology_M,
+    compute_energy,
+    compute_pairwise_collision_3d,
+)
 from video_synopsis.optimization.visualize import save_initial_vs_optimized
 
 log = logging.getLogger(__name__)
@@ -69,6 +73,8 @@ class MCTSNode:
         collision_method: str = "centroid",
         sigma: float = 50.0,
         radius: float = 30.0,
+        w_chronology: float = 0.0,
+        chronology_M: float = 0.0,
         c_puct: float = 1.4,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
@@ -90,6 +96,8 @@ class MCTSNode:
         self.collision_method = collision_method
         self.sigma = sigma
         self.radius = radius
+        self.w_chronology = w_chronology
+        self.chronology_M = chronology_M
         self.c_puct = c_puct
         self.slot_tolerance = slot_tolerance
         self.prior_probs: Dict[int, float] = {}
@@ -174,6 +182,8 @@ class MCTSNode:
             collision_method=self.collision_method,
             sigma=self.sigma,
             radius=self.radius,
+            w_chronology=self.w_chronology,
+            chronology_M=self.chronology_M,
             c_puct=self.c_puct,
             slot_tolerance=self.slot_tolerance,
         )
@@ -267,6 +277,8 @@ class MCTSNode:
             w_duration=1.0,
             w_collision=10.0,
             w_activity=10.0,
+            w_chronology=self.w_chronology,
+            chronology_M=self.chronology_M,
             method=self.collision_method,
             sigma=self.sigma,
             radius=self.radius,
@@ -318,6 +330,8 @@ def _self_play_episode(
     collision_method: str,
     sigma: float,
     radius: float,
+    w_chronology: float,
+    chronology_M: float,
     mcts_sims: int,
     video_size: Tuple[int, int],
     c_puct: float,
@@ -335,6 +349,8 @@ def _self_play_episode(
         collision_method=collision_method,
         sigma=sigma,
         radius=radius,
+        w_chronology=w_chronology,
+        chronology_M=chronology_M,
         size=video_size,
         c_puct=c_puct,
         dirichlet_alpha=dirichlet_alpha,
@@ -408,6 +424,7 @@ class MCTSOptimizer(BaseOptimizer):
         collision_method: str = "centroid",
         sigma: float = 50.0,
         radius: float = 30.0,
+        w_chronology: float = 0.0,
         slot_tolerance: float = 0.5,
         c_puct: float = 1.4,
         dirichlet_alpha: float = 0.3,
@@ -426,6 +443,7 @@ class MCTSOptimizer(BaseOptimizer):
         self.collision_method = collision_method
         self.sigma = sigma
         self.radius = radius
+        self.w_chronology = w_chronology
         self.slot_tolerance = slot_tolerance
         self.c_puct = c_puct
         self.dirichlet_alpha = dirichlet_alpha
@@ -457,6 +475,10 @@ class MCTSOptimizer(BaseOptimizer):
             f"hard={search_horizon:.1f}s (video={total_seconds:.1f}s)"
         )
 
+        chronology_M = auto_tune_chronology_M(tubes) if self.w_chronology > 0 else 0.0
+        if self.w_chronology > 0:
+            log.info(f"Chronology weight: {self.w_chronology:.3f}, auto-tuned M: {chronology_M:.1f}s")
+
         num_tubes = len(tubes)
         nn_input = num_tubes * 3
         model = TubeNet(nn_input, num_actions=num_tubes).to(device)
@@ -471,6 +493,7 @@ class MCTSOptimizer(BaseOptimizer):
                 data = _self_play_episode(
                     model, tubes, search_horizon, device,
                     self.collision_method, self.sigma, self.radius,
+                    self.w_chronology, chronology_M,
                     self.mcts_sims_training, self.video_size,
                     self.c_puct, self.dirichlet_alpha, self.dirichlet_epsilon,
                     self.slot_tolerance,
@@ -498,6 +521,8 @@ class MCTSOptimizer(BaseOptimizer):
                 collision_method=self.collision_method,
                 sigma=self.sigma,
                 radius=self.radius,
+                w_chronology=self.w_chronology,
+                chronology_M=chronology_M,
                 size=self.video_size,
                 c_puct=self.c_puct,
                 dirichlet_alpha=0.0,
@@ -529,6 +554,8 @@ class MCTSOptimizer(BaseOptimizer):
                 collision_method=self.collision_method,
                 sigma=self.sigma,
                 radius=self.radius,
+                w_chronology=self.w_chronology,
+                chronology_M=chronology_M,
                 slot_tolerance=self.slot_tolerance,
             )
             for tid in remaining:

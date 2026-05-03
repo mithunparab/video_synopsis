@@ -142,6 +142,7 @@ class Pipeline:
                 collision_method=cfg.collision_method,
                 sigma=cfg.sigma,
                 radius=cfg.collision_radius,
+                w_chronology=cfg.w_chronology,
                 output_dir=cfg.optimized_tubes_dir,
                 fps=fps,
             )
@@ -156,6 +157,21 @@ class Pipeline:
                 collision_method=cfg.collision_method,
                 sigma=cfg.sigma,
                 radius=cfg.collision_radius,
+                w_chronology=cfg.w_chronology,
+                output_dir=cfg.optimized_tubes_dir,
+                fps=fps,
+            )
+        elif cfg.optimizer == "mcmc":
+            from video_synopsis.optimization.mcmc import MCMCOptimizer
+            return MCMCOptimizer(
+                num_chains=cfg.mcmc_chains,
+                num_steps=cfg.mcmc_steps,
+                proposal_std=cfg.mcmc_proposal_std,
+                global_jump_prob=cfg.mcmc_global_jump_prob,
+                collision_method=cfg.collision_method,
+                sigma=cfg.sigma,
+                radius=cfg.collision_radius,
+                w_chronology=cfg.w_chronology,
                 output_dir=cfg.optimized_tubes_dir,
                 fps=fps,
             )
@@ -170,6 +186,7 @@ class Pipeline:
                 collision_method=cfg.collision_method,
                 sigma=cfg.sigma,
                 radius=cfg.collision_radius,
+                w_chronology=cfg.w_chronology,
                 c_puct=cfg.mcts_c_puct,
                 output_dir=cfg.optimized_tubes_dir,
                 fps=fps,

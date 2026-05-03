@@ -176,12 +176,65 @@ def compute_total_collision_3d(
     return total
 
 
+def auto_tune_chronology_M(tubes: dict) -> float:
+    """Auto-tune the chronology cutoff distance.
+
+    Follows Nie et al. (TIP 2019): sort tubes by source-time first-frame, take
+    the median of the +2-stride pairwise gaps. Tubes whose source first-frames
+    are closer than M get strict order preservation; pairs farther apart can
+    swap freely.
+    """
+    src_starts = sorted(
+        float(t.timestamps_array.min()) for t in tubes.values() if t.num_frames > 0
+    )
+    if len(src_starts) < 3:
+        return 1.0
+    diffs = sorted(
+        abs(src_starts[i + 2] - src_starts[i]) for i in range(len(src_starts) - 2)
+    )
+    return max(diffs[len(diffs) // 2], 1e-6)
+
+
+def compute_chronology_np(
+    tubes: dict,
+    starts: dict,
+    M: float,
+) -> float:
+    """Sum of inversion penalties (CPU). See ``compute_chronology_torch`` for
+    the formula. Returns the unweighted total — the caller multiplies by
+    ``w_chronology``.
+    """
+    if M <= 0:
+        return 0.0
+    ids = [tid for tid in tubes if tid in starts and tubes[tid].num_frames > 0]
+    if len(ids) < 2:
+        return 0.0
+    src = [float(tubes[tid].timestamps_array.min()) for tid in ids]
+    syn = [float(starts[tid]) for tid in ids]
+    M_safe = max(float(M), 1e-6)
+    cost = 0.0
+    for i in range(len(ids)):
+        for j in range(len(ids)):
+            if i == j:
+                continue
+            src_diff = src[j] - src[i]
+            if src_diff <= 0:
+                continue  # only count pairs where j is later in source
+            syn_diff = syn[j] - syn[i]
+            if syn_diff < 0:  # inverted
+                proximity = max(0.0, 1.0 - src_diff / M_safe)
+                cost += proximity * (-syn_diff)
+    return cost
+
+
 def compute_energy(
     tubes: dict,
     starts: dict,
     w_duration: float = 1.0,
     w_collision: float = 10.0,
     w_activity: float = 0.1,
+    w_chronology: float = 0.0,
+    chronology_M: float = 0.0,
     method: str = "repulsion",
     sigma: float = 50.0,
     radius: float = 30.0,
@@ -190,7 +243,7 @@ def compute_energy(
 ) -> float:
     """Compute total energy for a tube placement (numpy / CPU).
 
-    E_total = w_duration * E_duration + w_collision * E_collision_3d + w_activity * E_activity
+    E_total = w_duration·E_dur + w_collision·E_col + w_activity·E_act + w_chronology·E_chron
     """
     max_end = 0.0
     for tid, tube in tubes.items():
@@ -203,6 +256,10 @@ def compute_energy(
         tubes, starts, method=method, sigma=sigma, radius=radius, sample_step=sample_step
     )
 
+    e_chronology = 0.0
+    if w_chronology > 0 and chronology_M > 0:
+        e_chronology = compute_chronology_np(tubes, starts, chronology_M)
+
     e_activity = 0.0
     if video_length > 0:
         for tid, start in starts.items():
@@ -214,7 +271,12 @@ def compute_energy(
                 if end > video_length:
                     e_activity += end - video_length
 
-    return w_duration * e_duration + w_collision * e_collision + w_activity * e_activity
+    return (
+        w_duration * e_duration
+        + w_collision * e_collision
+        + w_activity * e_activity
+        + w_chronology * e_chronology
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -245,6 +307,7 @@ class TubeBatch:
         rel_ts = torch.zeros((N, max(T_max, 1)), dtype=dtype)
         lengths = torch.zeros((N,), dtype=torch.long)
         durations = torch.zeros((N,), dtype=dtype)
+        src_starts = torch.zeros((N,), dtype=dtype)  # source-time first-frame per tube
 
         for i, tid in enumerate(ids):
             tube = tubes[tid]
@@ -253,6 +316,7 @@ class TubeBatch:
                 continue
             bb = torch.from_numpy(tube.bboxes_array.astype(np.float32))
             ts = torch.from_numpy(tube.timestamps_array.astype(np.float32))
+            src_starts[i] = float(ts.min())
             ts = ts - ts.min()
             bboxes[i, :n] = bb.to(dtype)
             rel_ts[i, :n] = ts.to(dtype)
@@ -271,6 +335,7 @@ class TubeBatch:
         self.rel_ts = rel_ts.to(device)
         self.lengths = lengths.to(device)
         self.durations = durations.to(device)
+        self.src_starts = src_starts.to(device)
 
         if N >= 2:
             pi, pj = torch.triu_indices(N, N, offset=1)
@@ -468,12 +533,51 @@ def compute_collision_energy_torch(
     return out.squeeze(0) if squeeze_at_end else out
 
 
+def compute_chronology_torch(
+    src_starts: torch.Tensor,
+    syn_starts: torch.Tensor,
+    M: float,
+) -> torch.Tensor:
+    """Inversion penalty: synopsis order should follow source order for pairs
+    that were close together in source.
+
+    For each pair (i, j) where ``src[j] > src[i]``, charge cost when
+    ``syn[j] < syn[i]`` (inversion). The penalty scales with how much j is
+    earlier in synopsis (linear) and how close i, j are in source
+    (``max(0, 1 − Δsrc / M)``). Pairs farther than M apart in source are
+    free to swap.
+
+    ``syn_starts`` may be ``[N]`` or ``[B, N]``. Returns ``[]`` or ``[B]``.
+    Auto-tune M with :func:`auto_tune_chronology_M`.
+    """
+    if M <= 0:
+        if syn_starts.ndim == 1:
+            return torch.zeros((), device=syn_starts.device, dtype=syn_starts.dtype)
+        return torch.zeros((syn_starts.shape[0],), device=syn_starts.device, dtype=syn_starts.dtype)
+
+    squeeze = syn_starts.ndim == 1
+    syn = syn_starts.unsqueeze(0) if squeeze else syn_starts          # [B, N]
+
+    src_diff = src_starts.unsqueeze(-2) - src_starts.unsqueeze(-1)    # [N, N]; src[j]-src[i]
+    syn_diff = syn.unsqueeze(-2) - syn.unsqueeze(-1)                  # [B, N, N]; syn[j]-syn[i]
+
+    M_safe = max(float(M), 1e-6)
+    src_mask = (src_diff > 0).to(syn.dtype)
+    proximity = (1.0 - src_diff.clamp(min=0) / M_safe).clamp(min=0.0) * src_mask   # [N, N]
+    inversion = (-syn_diff).clamp(min=0.0)                             # [B, N, N]
+
+    cost = (proximity.unsqueeze(0) * inversion).sum(dim=(-2, -1))     # [B]
+    return cost.squeeze(0) if squeeze else cost
+
+
 def compute_energy_torch(
     batch: TubeBatch,
     starts: torch.Tensor,
     w_duration: float = 1.0,
     w_collision: float = 10.0,
     w_activity: float = 0.1,
+    w_chronology: float = 0.0,
+    chronology_M: float = 0.0,
     method: str = "repulsion",
     sigma: float = 50.0,
     radius: float = 30.0,
@@ -486,6 +590,7 @@ def compute_energy_torch(
     Args:
         starts: ``[N]`` or ``[B, N]``.
         chunk_size: collision-kernel batch chunk for memory bounding.
+        w_chronology, chronology_M: see :func:`compute_chronology_torch`.
 
     Returns:
         ``[]`` or ``[B]`` matching input rank.
@@ -508,5 +613,15 @@ def compute_energy_torch(
     else:
         e_activity = torch.zeros_like(e_duration)
 
-    total = w_duration * e_duration + w_collision * e_collision + w_activity * e_activity
+    if w_chronology > 0 and chronology_M > 0:
+        e_chronology = compute_chronology_torch(batch.src_starts, starts_b, chronology_M)
+    else:
+        e_chronology = torch.zeros_like(e_duration)
+
+    total = (
+        w_duration * e_duration
+        + w_collision * e_collision
+        + w_activity * e_activity
+        + w_chronology * e_chronology
+    )
     return total.squeeze(0) if squeeze_at_end else total
