@@ -123,6 +123,14 @@ def _build_optimizer(name: str, output_dir: str, args, fps: float):
             num_steps=args.mcmc_steps,
             proposal_std=args.mcmc_proposal_std,
             global_jump_prob=args.mcmc_global_jump_prob,
+            optimize_speed=args.mcmc_optimize_speed,
+            optimize_size=args.mcmc_optimize_size,
+            paragraph_seconds=args.paragraph_seconds,
+            speed_min=args.speed_min,
+            speed_max=args.speed_max,
+            size_min=args.size_min,
+            w_speed_reg=args.w_speed_reg,
+            w_size_reg=args.w_size_reg,
             collision_method=args.collision_method,
             sigma=args.sigma,
             radius=args.collision_radius,
@@ -192,6 +200,12 @@ def _spawn_subprocess(
         "--mcmc_steps", str(args.mcmc_steps),
         "--mcmc_proposal_std", str(args.mcmc_proposal_std),
         "--mcmc_global_jump_prob", str(args.mcmc_global_jump_prob),
+        "--paragraph_seconds", str(args.paragraph_seconds),
+        "--speed_min", str(args.speed_min),
+        "--speed_max", str(args.speed_max),
+        "--size_min", str(args.size_min),
+        "--w_speed_reg", str(args.w_speed_reg),
+        "--w_size_reg", str(args.w_size_reg),
         "--energy_epochs", str(args.energy_epochs),
         "--pso_num_particles", str(args.pso_num_particles),
         "--pso_max_iterations", str(args.pso_max_iterations),
@@ -201,6 +215,10 @@ def _spawn_subprocess(
         "--mcts_sims_final", str(args.mcts_sims_final),
         "--single_method",
     ]
+    if getattr(args, "mcmc_optimize_speed", False):
+        cmd.append("--mcmc_optimize_speed")
+    if getattr(args, "mcmc_optimize_size", False):
+        cmd.append("--mcmc_optimize_size")
 
     env = os.environ.copy()
     if gpu_id is not None:
@@ -275,6 +293,23 @@ def main() -> int:
     parser.add_argument("--mcmc_global_jump_prob", type=float, default=0.1,
                         help="Probability of replacing the proposal with a uniform draw "
                              "across the valid range (helps escape local minima).")
+    parser.add_argument("--mcmc_optimize_speed", action="store_true",
+                        help="Let MCMC propose per-paragraph playback speed changes "
+                             "(synopsis duration of paragraph k = src_dur[k] / speed[k]).")
+    parser.add_argument("--mcmc_optimize_size", action="store_true",
+                        help="Let MCMC propose per-paragraph spatial size scales "
+                             "(bbox shrinks toward centroid; effective collision radius "
+                             "scales with avg(size_i, size_j)).")
+    parser.add_argument("--paragraph_seconds", type=float, default=2.0,
+                        help="Source-time length of each paragraph (one speed/size knob per paragraph).")
+    parser.add_argument("--speed_min", type=float, default=0.5)
+    parser.add_argument("--speed_max", type=float, default=4.0)
+    parser.add_argument("--size_min", type=float, default=0.5)
+    parser.add_argument("--w_speed_reg", type=float, default=1.0,
+                        help="Penalty weight on speed deviation from 1.0; without this the "
+                             "optimizer tends to extreme speeds that look bad on playback.")
+    parser.add_argument("--w_size_reg", type=float, default=1.0,
+                        help="Penalty weight on size deviation from 1.0.")
     parser.add_argument("--fps", type=float, default=0.0,
                         help="FPS for converting video_length_frames -> seconds. "
                              "Default: read metadata.json or fall back to 30.")

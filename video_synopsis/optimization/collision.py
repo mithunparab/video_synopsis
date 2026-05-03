@@ -296,18 +296,39 @@ class TubeBatch:
         tubes: Dict[int, Tube],
         device: torch.device,
         dtype: torch.dtype = torch.float32,
+        paragraph_seconds: float = 2.0,
     ):
+        """``paragraph_seconds`` controls how each tube is split into paragraphs.
+        ``K_max`` will be ``ceil(longest_tube_dur / paragraph_seconds)``. With
+        ``paragraph_seconds`` very large, every tube is a single paragraph
+        (legacy behaviour: speeds[N,1]=1, sizes[N,1]=1)."""
         ids = sorted(tubes.keys())
         self.ids = ids
         self.id_to_idx = {tid: i for i, tid in enumerate(ids)}
         N = len(ids)
         T_max = max((t.num_frames for t in tubes.values()), default=0)
+        self.paragraph_seconds = float(paragraph_seconds)
+
+        # Per-tube paragraph counts and the maximum across the batch (for padding).
+        para_counts = []
+        for tid in ids:
+            tube = tubes[tid]
+            if tube.num_frames == 0:
+                para_counts.append(1)
+            else:
+                para_counts.append(max(1, int(np.ceil(tube.duration / max(paragraph_seconds, 1e-6)))))
+        K_max = max(para_counts) if para_counts else 1
 
         bboxes = torch.zeros((N, max(T_max, 1), 4), dtype=dtype)
         rel_ts = torch.zeros((N, max(T_max, 1)), dtype=dtype)
         lengths = torch.zeros((N,), dtype=torch.long)
         durations = torch.zeros((N,), dtype=dtype)
         src_starts = torch.zeros((N,), dtype=dtype)  # source-time first-frame per tube
+        # Paragraph tables; padded with src_dur=0 past the real K so a fully
+        # vectorised kernel can divide by speed without touching invalid cells.
+        para_lengths = torch.zeros((N,), dtype=torch.long)
+        src_para_starts = torch.zeros((N, K_max), dtype=dtype)
+        src_para_durs = torch.zeros((N, K_max), dtype=dtype)
 
         for i, tid in enumerate(ids):
             tube = tubes[tid]
@@ -323,6 +344,14 @@ class TubeBatch:
             lengths[i] = n
             durations[i] = float(tube.duration)
 
+            K = para_counts[i]
+            para_lengths[i] = K
+            base_dur = float(tube.duration) / K
+            for k in range(K):
+                src_para_starts[i, k] = k * base_dur
+                src_para_durs[i, k] = base_dur
+            src_para_durs[i, K - 1] = float(tube.duration) - (K - 1) * base_dur
+
         # Tail-fill rel_ts with the last valid value so searchsorted still
         # treats it as monotone non-decreasing past the tube length.
         for i in range(N):
@@ -336,6 +365,10 @@ class TubeBatch:
         self.lengths = lengths.to(device)
         self.durations = durations.to(device)
         self.src_starts = src_starts.to(device)
+        self.para_lengths = para_lengths.to(device)
+        self.src_para_starts = src_para_starts.to(device)
+        self.src_para_durs = src_para_durs.to(device)
+        self.K_max = K_max
 
         if N >= 2:
             pi, pj = torch.triu_indices(N, N, offset=1)
@@ -383,6 +416,78 @@ def _bbox_centroid_dist_batched(a: torch.Tensor, b: torch.Tensor, radius: float)
     return (1.0 - dist / max(float(radius), 1e-6)).clamp(min=0.0)
 
 
+def _bbox_centroid_dist_batched_R(a: torch.Tensor, b: torch.Tensor, radius_per_sample: torch.Tensor) -> torch.Tensor:
+    """Centroid hinge with per-sample radius. ``radius_per_sample`` broadcasts to ``a[..., 0]``."""
+    cx_a = (a[..., 0] + a[..., 2]) / 2
+    cy_a = (a[..., 1] + a[..., 3]) / 2
+    cx_b = (b[..., 0] + b[..., 2]) / 2
+    cy_b = (b[..., 1] + b[..., 3]) / 2
+    dist = torch.sqrt((cx_a - cx_b) ** 2 + (cy_a - cy_b) ** 2 + 1e-9)
+    R = radius_per_sample.clamp(min=1e-6)
+    return (1.0 - dist / R).clamp(min=0.0)
+
+
+def _scale_bbox_around_centroid(bbox: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Shrink each ``[..., 4]`` bbox by ``scale`` toward its centre.
+
+    ``scale`` broadcasts to ``bbox[..., 0]``. Returns a new tensor.
+    """
+    cx = (bbox[..., 0] + bbox[..., 2]) / 2
+    cy = (bbox[..., 1] + bbox[..., 3]) / 2
+    half_w = (bbox[..., 2] - bbox[..., 0]) / 2 * scale
+    half_h = (bbox[..., 3] - bbox[..., 1]) / 2 * scale
+    return torch.stack([cx - half_w, cy - half_h, cx + half_w, cy + half_h], dim=-1)
+
+
+def _paragraph_time_map(
+    syn_offset: torch.Tensor,            # [B, P, Ks]
+    cum_syn_starts: torch.Tensor,        # [B, P, Kp] cumulative synopsis-time start of each paragraph
+    src_para_starts: torch.Tensor,       # [P, Kp] source-time start per paragraph
+    speeds: torch.Tensor,                # [B, P, Kp]
+    sizes: torch.Tensor,                 # [B, P, Kp]
+    last_para_idx: torch.Tensor,         # [P] long, last valid paragraph index
+):
+    """Map per-sample synopsis offsets to source-time offsets via the paragraph map.
+
+    Returns ``(t_src, size_at_t)`` both shape ``[B, P, Ks]``.
+    """
+    B, P, Ks = syn_offset.shape
+    Kp = src_para_starts.shape[-1]
+
+    # searchsorted requires monotone-ascending rows; cum_syn_starts is by construction.
+    cum_flat = cum_syn_starts.reshape(B * P, Kp).contiguous()
+    off_flat = syn_offset.reshape(B * P, Ks).contiguous()
+    idx_flat = (torch.searchsorted(cum_flat, off_flat, right=True) - 1).clamp(min=0)  # [B*P, Ks]
+
+    last_BP = last_para_idx.unsqueeze(0).expand(B, P).reshape(B * P).unsqueeze(-1)     # [B*P, 1]
+    idx_flat = torch.minimum(idx_flat, last_BP)
+    idx = idx_flat.reshape(B, P, Ks)                                                   # [B, P, Ks]
+
+    cum_at = cum_syn_starts.gather(2, idx)
+    speed_at = speeds.gather(2, idx)
+    size_at = sizes.gather(2, idx)
+    src_at = src_para_starts.unsqueeze(0).expand(B, P, Kp).gather(2, idx)
+
+    t_src = src_at + (syn_offset - cum_at) * speed_at
+    return t_src, size_at
+
+
+def _synopsis_duration_per_tube(
+    src_para_durs: torch.Tensor,    # [N, Kp]
+    speeds: torch.Tensor,           # [B, N, Kp] or [N, Kp]
+    para_lengths: torch.Tensor,     # [N]
+) -> torch.Tensor:
+    """``sum(src_dur[k] / speed[k])`` over valid paragraphs only. Returns ``[B, N]`` or ``[N]``."""
+    Kp = src_para_durs.shape[-1]
+    arange = torch.arange(Kp, device=src_para_durs.device).unsqueeze(0)
+    valid = (arange < para_lengths.unsqueeze(-1)).to(src_para_durs.dtype)              # [N, Kp]
+    if speeds.ndim == 3:
+        per_para = src_para_durs.unsqueeze(0) / speeds.clamp(min=1e-6) * valid.unsqueeze(0)
+        return per_para.sum(dim=-1)
+    else:
+        return ((src_para_durs / speeds.clamp(min=1e-6)) * valid).sum(dim=-1)
+
+
 def _gather_nearest(
     rel_ts: torch.Tensor,         # [P, T_max] sorted ascending, padded with last value
     bboxes: torch.Tensor,         # [P, T_max, 4]
@@ -425,8 +530,18 @@ def _collision_chunk(
     rel_ts_b: torch.Tensor,
     last_idx_a: torch.Tensor, # [P] long
     last_idx_b: torch.Tensor,
-    max_rel_a: torch.Tensor,  # [P]
-    max_rel_b: torch.Tensor,
+    syn_dur_a: torch.Tensor,  # [B, P]  synopsis duration of tube_a in each pair
+    syn_dur_b: torch.Tensor,  # [B, P]
+    cum_syn_a: torch.Tensor,  # [B, P, Kp] cumulative synopsis start per paragraph
+    cum_syn_b: torch.Tensor,
+    src_para_a: torch.Tensor, # [P, Kp]
+    src_para_b: torch.Tensor,
+    speeds_a: torch.Tensor,   # [B, P, Kp]
+    speeds_b: torch.Tensor,
+    sizes_a: torch.Tensor,    # [B, P, Kp]
+    sizes_b: torch.Tensor,
+    last_para_a: torch.Tensor,# [P] long
+    last_para_b: torch.Tensor,
     valid_pair: torch.Tensor, # [P] bool
     method: str,
     sigma: float,
@@ -438,9 +553,9 @@ def _collision_chunk(
     start_b_ = starts_b.index_select(1, pair_j)
 
     a_lo = start_a
-    a_hi = start_a + max_rel_a.unsqueeze(0)
+    a_hi = start_a + syn_dur_a
     b_lo = start_b_
-    b_hi = start_b_ + max_rel_b.unsqueeze(0)
+    b_hi = start_b_ + syn_dur_b
 
     overlap_lo = torch.maximum(a_lo, b_lo)
     overlap_hi = torch.minimum(a_hi, b_hi)
@@ -449,22 +564,58 @@ def _collision_chunk(
     u = torch.linspace(0, 1, K, device=starts_b.device, dtype=starts_b.dtype)
     sample_times = overlap_lo.unsqueeze(-1) + u * (overlap_hi - overlap_lo).unsqueeze(-1)
 
-    target_a = sample_times - start_a.unsqueeze(-1)
-    target_b = sample_times - start_b_.unsqueeze(-1)
+    syn_off_a = sample_times - start_a.unsqueeze(-1)
+    syn_off_b = sample_times - start_b_.unsqueeze(-1)
 
-    bbox_a_at_t = _gather_nearest(rel_ts_a, bboxes_a, last_idx_a, target_a)
-    bbox_b_at_t = _gather_nearest(rel_ts_b, bboxes_b, last_idx_b, target_b)
+    t_src_a, size_a = _paragraph_time_map(syn_off_a, cum_syn_a, src_para_a, speeds_a, sizes_a, last_para_a)
+    t_src_b, size_b = _paragraph_time_map(syn_off_b, cum_syn_b, src_para_b, speeds_b, sizes_b, last_para_b)
+
+    bbox_a_at_t = _gather_nearest(rel_ts_a, bboxes_a, last_idx_a, t_src_a)
+    bbox_b_at_t = _gather_nearest(rel_ts_b, bboxes_b, last_idx_b, t_src_b)
 
     if method == "iou":
-        e = _bbox_iou_batched(bbox_a_at_t, bbox_b_at_t)
+        # IoU sees size by literally shrinking the bbox toward its centroid.
+        bbox_a_s = _scale_bbox_around_centroid(bbox_a_at_t, size_a.unsqueeze(-1))
+        bbox_b_s = _scale_bbox_around_centroid(bbox_b_at_t, size_b.unsqueeze(-1))
+        e = _bbox_iou_batched(bbox_a_s, bbox_b_s)
     elif method == "centroid":
-        e = _bbox_centroid_dist_batched(bbox_a_at_t, bbox_b_at_t, radius)
+        # Centroid metric: shrinking bboxes doesn't move centroids, so size
+        # affects collision via an effective radius `R_eff = R · (s_i + s_j)/2`.
+        # Both shrunken → tubes can be closer; both full → standard R.
+        R_eff = radius * (size_a + size_b) / 2.0
+        e = _bbox_centroid_dist_batched_R(bbox_a_at_t, bbox_b_at_t, R_eff)
     else:
+        # repulsion is centroid-based; size doesn't apply directly — leave as-is.
         e = _bbox_repulsion_batched(bbox_a_at_t, bbox_b_at_t, sigma)
 
     e_per_pair = e.sum(dim=-1)
     e_per_pair = torch.where(has_overlap, e_per_pair, torch.zeros_like(e_per_pair))
     return e_per_pair.sum(dim=-1)
+
+
+def _prep_speeds_sizes(
+    batch: TubeBatch,
+    B: int,
+    speeds: Optional[torch.Tensor],
+    sizes: Optional[torch.Tensor],
+) -> tuple:
+    """Materialise ``speeds[B,N,Kp]`` and ``sizes[B,N,Kp]`` with sane defaults
+    (1.0 everywhere) when caller passes ``None``."""
+    Kp = batch.K_max
+    N = batch.N
+    if speeds is None:
+        sp = torch.ones((B, N, Kp), device=batch.device, dtype=batch.dtype)
+    elif speeds.ndim == 2:
+        sp = speeds.unsqueeze(0).expand(B, N, Kp)
+    else:
+        sp = speeds
+    if sizes is None:
+        sz = torch.ones((B, N, Kp), device=batch.device, dtype=batch.dtype)
+    elif sizes.ndim == 2:
+        sz = sizes.unsqueeze(0).expand(B, N, Kp)
+    else:
+        sz = sizes
+    return sp, sz
 
 
 def compute_collision_energy_torch(
@@ -475,11 +626,15 @@ def compute_collision_energy_torch(
     radius: float = 30.0,
     sample_count: int = 32,
     chunk_size: int = 32,
+    speeds: Optional[torch.Tensor] = None,
+    sizes: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Pairwise collision energy summed over all tube pairs.
 
     Args:
         starts: ``[N]`` for a single placement, or ``[B, N]`` for a batch.
+        speeds, sizes: ``[N, Kp]`` (broadcast across batch) or ``[B, N, Kp]``,
+            or ``None`` for ``1.0`` everywhere (legacy behaviour).
         chunk_size: process the batch dim in chunks of this size to bound
             peak memory. Output is independent of chunk size.
 
@@ -497,6 +652,8 @@ def compute_collision_energy_torch(
     K = max(1, int(sample_count))
     chunk = max(1, int(chunk_size))
 
+    speeds_BNK, sizes_BNK = _prep_speeds_sizes(batch, B, speeds, sizes)
+
     # Hoist per-pair tensors out of the chunk loop.
     pair_i = batch.pair_i
     pair_j = batch.pair_j
@@ -508,26 +665,50 @@ def compute_collision_energy_torch(
     len_b = batch.lengths.index_select(0, pair_j)
     last_idx_a = (len_a - 1).clamp(min=0)
     last_idx_b = (len_b - 1).clamp(min=0)
-    max_rel_a = rel_ts_a.gather(1, last_idx_a.unsqueeze(-1)).squeeze(-1)
-    max_rel_b = rel_ts_b.gather(1, last_idx_b.unsqueeze(-1)).squeeze(-1)
     valid_pair = (len_a > 0) & (len_b > 0)
 
-    if B <= chunk:
-        out = _collision_chunk(
-            starts_b, pair_i, pair_j,
+    src_para_a = batch.src_para_starts.index_select(0, pair_i)        # [P, Kp]
+    src_para_b = batch.src_para_starts.index_select(0, pair_j)
+    src_para_durs_a = batch.src_para_durs.index_select(0, pair_i)
+    src_para_durs_b = batch.src_para_durs.index_select(0, pair_j)
+    last_para_a = (batch.para_lengths.index_select(0, pair_i) - 1).clamp(min=0)
+    last_para_b = (batch.para_lengths.index_select(0, pair_j) - 1).clamp(min=0)
+
+    speeds_a_full = speeds_BNK.index_select(1, pair_i)                # [B, P, Kp]
+    speeds_b_full = speeds_BNK.index_select(1, pair_j)
+    sizes_a_full = sizes_BNK.index_select(1, pair_i)
+    sizes_b_full = sizes_BNK.index_select(1, pair_j)
+
+    syn_para_durs_a = src_para_durs_a.unsqueeze(0) / speeds_a_full.clamp(min=1e-6)
+    syn_para_durs_b = src_para_durs_b.unsqueeze(0) / speeds_b_full.clamp(min=1e-6)
+    cum_syn_a = torch.cumsum(syn_para_durs_a, dim=-1) - syn_para_durs_a
+    cum_syn_b = torch.cumsum(syn_para_durs_b, dim=-1) - syn_para_durs_b
+    Kp = batch.K_max
+    arange_kp = torch.arange(Kp, device=batch.device).unsqueeze(0)
+    valid_a = (arange_kp < batch.para_lengths.index_select(0, pair_i).unsqueeze(-1)).to(batch.dtype)
+    valid_b = (arange_kp < batch.para_lengths.index_select(0, pair_j).unsqueeze(-1)).to(batch.dtype)
+    syn_dur_a = (syn_para_durs_a * valid_a.unsqueeze(0)).sum(dim=-1)   # [B, P]
+    syn_dur_b = (syn_para_durs_b * valid_b.unsqueeze(0)).sum(dim=-1)
+
+    def _run(b_lo: int, b_hi: int) -> torch.Tensor:
+        return _collision_chunk(
+            starts_b[b_lo:b_hi], pair_i, pair_j,
             bboxes_a, bboxes_b, rel_ts_a, rel_ts_b,
-            last_idx_a, last_idx_b, max_rel_a, max_rel_b, valid_pair,
+            last_idx_a, last_idx_b,
+            syn_dur_a[b_lo:b_hi], syn_dur_b[b_lo:b_hi],
+            cum_syn_a[b_lo:b_hi], cum_syn_b[b_lo:b_hi],
+            src_para_a, src_para_b,
+            speeds_a_full[b_lo:b_hi], speeds_b_full[b_lo:b_hi],
+            sizes_a_full[b_lo:b_hi], sizes_b_full[b_lo:b_hi],
+            last_para_a, last_para_b,
+            valid_pair,
             method, sigma, radius, K,
         )
+
+    if B <= chunk:
+        out = _run(0, B)
     else:
-        parts = []
-        for s in range(0, B, chunk):
-            parts.append(_collision_chunk(
-                starts_b[s:s + chunk], pair_i, pair_j,
-                bboxes_a, bboxes_b, rel_ts_a, rel_ts_b,
-                last_idx_a, last_idx_b, max_rel_a, max_rel_b, valid_pair,
-                method, sigma, radius, K,
-            ))
+        parts = [_run(s, min(s + chunk, B)) for s in range(0, B, chunk)]
         out = torch.cat(parts, dim=0)
 
     return out.squeeze(0) if squeeze_at_end else out
@@ -584,26 +765,42 @@ def compute_energy_torch(
     video_length: float = 0.0,
     sample_count: int = 32,
     chunk_size: int = 32,
+    speeds: Optional[torch.Tensor] = None,
+    sizes: Optional[torch.Tensor] = None,
+    w_speed_reg: float = 0.0,
+    w_size_reg: float = 0.0,
+    speed_reg_alpha: float = 2.0,
+    size_reg_alpha: float = 2.0,
 ) -> torch.Tensor:
     """Total placement energy.
 
     Args:
         starts: ``[N]`` or ``[B, N]``.
+        speeds, sizes: optional ``[N, Kp]`` or ``[B, N, Kp]`` (default = 1.0).
         chunk_size: collision-kernel batch chunk for memory bounding.
         w_chronology, chronology_M: see :func:`compute_chronology_torch`.
+        w_speed_reg, w_size_reg: regularisation on speed/size deviation from 1
+            (``exp(α·max(s, 1/s)) − 1``-style cost). Without this the optimiser
+            always picks the cheapest speed/size — typically extreme values that
+            look bad at render time. Only active when ``speeds``/``sizes`` are
+            provided.
 
     Returns:
         ``[]`` or ``[B]`` matching input rank.
     """
     squeeze_at_end = starts.ndim == 1
     starts_b = starts.unsqueeze(0) if squeeze_at_end else starts
+    B = starts_b.shape[0]
 
-    ends = starts_b + batch.durations.unsqueeze(0)               # [B, N]
+    speeds_BNK, sizes_BNK = _prep_speeds_sizes(batch, B, speeds, sizes)
+    syn_dur_per_tube = _synopsis_duration_per_tube(batch.src_para_durs, speeds_BNK, batch.para_lengths)
+    ends = starts_b + syn_dur_per_tube                            # [B, N]
     e_duration = ends.max(dim=-1).values                          # [B]
 
     e_collision = compute_collision_energy_torch(
         batch, starts_b, method=method, sigma=sigma, radius=radius,
         sample_count=sample_count, chunk_size=chunk_size,
+        speeds=speeds_BNK, sizes=sizes_BNK,
     )
 
     if video_length > 0:
@@ -618,10 +815,27 @@ def compute_energy_torch(
     else:
         e_chronology = torch.zeros_like(e_duration)
 
+    e_reg = torch.zeros_like(e_duration)
+    if (w_speed_reg > 0 or w_size_reg > 0) and (speeds is not None or sizes is not None):
+        Kp = batch.K_max
+        arange_kp = torch.arange(Kp, device=batch.device).unsqueeze(0)
+        valid_NK = (arange_kp < batch.para_lengths.unsqueeze(-1)).to(batch.dtype)   # [N, Kp]
+        if w_speed_reg > 0:
+            sp = speeds_BNK.clamp(min=1e-6)
+            # exp(α·max(s, 1/s) − α) − 1: 0 at s=1, grows in both directions.
+            ratio = torch.maximum(sp, 1.0 / sp)
+            cost = torch.exp(speed_reg_alpha * (ratio - 1.0)) - 1.0
+            e_reg = e_reg + w_speed_reg * (cost * valid_NK.unsqueeze(0)).sum(dim=(-2, -1))
+        if w_size_reg > 0:
+            sz = sizes_BNK.clamp(min=1e-6)
+            cost = torch.exp(size_reg_alpha * (1.0 / sz - 1.0)) - 1.0
+            e_reg = e_reg + w_size_reg * (cost * valid_NK.unsqueeze(0)).sum(dim=(-2, -1))
+
     total = (
         w_duration * e_duration
         + w_collision * e_collision
         + w_activity * e_activity
         + w_chronology * e_chronology
+        + e_reg
     )
     return total.squeeze(0) if squeeze_at_end else total

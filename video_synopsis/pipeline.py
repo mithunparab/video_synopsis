@@ -168,6 +168,14 @@ class Pipeline:
                 num_steps=cfg.mcmc_steps,
                 proposal_std=cfg.mcmc_proposal_std,
                 global_jump_prob=cfg.mcmc_global_jump_prob,
+                optimize_speed=cfg.mcmc_optimize_speed,
+                optimize_size=cfg.mcmc_optimize_size,
+                paragraph_seconds=cfg.paragraph_seconds,
+                speed_min=cfg.speed_min,
+                speed_max=cfg.speed_max,
+                size_min=cfg.size_min,
+                w_speed_reg=cfg.w_speed_reg,
+                w_size_reg=cfg.w_size_reg,
                 collision_method=cfg.collision_method,
                 sigma=cfg.sigma,
                 radius=cfg.collision_radius,
@@ -263,14 +271,21 @@ class Pipeline:
             )
         )
         stitcher = Stitcher(bgimg, fps=fps)
-        stitcher.render(tubes, optimized_starts, output_video)
+        schedules = getattr(self._optimizer, "last_schedules", None) if cfg.energy_optimization else None
+        if schedules:
+            stitcher.render_with_schedules(tubes, schedules, output_video)
+            synopsis_duration = max(
+                s.start + s.synopsis_duration for s in schedules.values()
+            )
+        else:
+            stitcher.render(tubes, optimized_starts, output_video)
+            synopsis_duration = max(
+                (optimized_starts[tid] + tubes[tid].duration) for tid in tubes
+            )
 
         # Log timing summary
         elapsed = time.time() - start_time
         orig_duration = video_length / fps
-        synopsis_duration = max(
-            (optimized_starts[tid] + tubes[tid].duration) for tid in tubes
-        )
         orig_m, orig_s = divmod(int(orig_duration), 60)
         syn_m, syn_s = divmod(int(synopsis_duration), 60)
         log.info(
@@ -330,13 +345,18 @@ class Pipeline:
             )
         )
         stitcher = Stitcher(bgimg, fps=fps)
-        stitcher.render(tubes, optimized_starts, output_video)
+        schedules = getattr(self._optimizer, "last_schedules", None) if cfg.energy_optimization else None
+        if schedules:
+            stitcher.render_with_schedules(tubes, schedules, output_video)
+            synopsis_duration = max(s.start + s.synopsis_duration for s in schedules.values())
+        else:
+            stitcher.render(tubes, optimized_starts, output_video)
+            synopsis_duration = max(
+                (optimized_starts[tid] + tubes[tid].duration) for tid in tubes
+            )
 
         elapsed = time.time() - start_time
         orig_duration = video_length / fps
-        synopsis_duration = max(
-            (optimized_starts[tid] + tubes[tid].duration) for tid in tubes
-        )
         compression = orig_duration / synopsis_duration if synopsis_duration > 0 else 0.0
         orig_m, orig_s = divmod(int(orig_duration), 60)
         syn_m, syn_s = divmod(int(synopsis_duration), 60)

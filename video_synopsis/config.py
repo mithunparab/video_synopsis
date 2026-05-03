@@ -53,6 +53,17 @@ class Config:
     mcmc_steps: int = 50000
     mcmc_proposal_std: float = 5.0
     mcmc_global_jump_prob: float = 0.1
+    mcmc_optimize_speed: bool = False
+    mcmc_optimize_size: bool = False
+
+    # Paragraph speed/size (Nie et al. 2019). All only active when MCMC has
+    # ``optimize_speed`` / ``optimize_size`` on; renderer otherwise uses speed=1, size=1.
+    paragraph_seconds: float = 2.0
+    speed_min: float = 0.5
+    speed_max: float = 4.0
+    size_min: float = 0.5
+    w_speed_reg: float = 1.0
+    w_size_reg: float = 1.0
 
     # MCTS-specific
     mcts_training_episodes: int = 10
@@ -148,6 +159,14 @@ class Config:
         parser.add_argument("--mcmc_steps", type=int, default=cls.mcmc_steps)
         parser.add_argument("--mcmc_proposal_std", type=float, default=cls.mcmc_proposal_std)
         parser.add_argument("--mcmc_global_jump_prob", type=float, default=cls.mcmc_global_jump_prob)
+        parser.add_argument("--mcmc_optimize_speed", action="store_true", default=cls.mcmc_optimize_speed)
+        parser.add_argument("--mcmc_optimize_size", action="store_true", default=cls.mcmc_optimize_size)
+        parser.add_argument("--paragraph_seconds", type=float, default=cls.paragraph_seconds)
+        parser.add_argument("--speed_min", type=float, default=cls.speed_min)
+        parser.add_argument("--speed_max", type=float, default=cls.speed_max)
+        parser.add_argument("--size_min", type=float, default=cls.size_min)
+        parser.add_argument("--w_speed_reg", type=float, default=cls.w_speed_reg)
+        parser.add_argument("--w_size_reg", type=float, default=cls.w_size_reg)
 
         parser.add_argument("--mcts_training_episodes", type=int, default=cls.mcts_training_episodes)
         parser.add_argument("--mcts_games_per_episode", type=int, default=cls.mcts_games_per_episode)

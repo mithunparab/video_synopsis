@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 
 from video_synopsis.data.types import Tube
+from video_synopsis.optimization.schedule import Schedule
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +123,90 @@ class Stitcher:
 
         writer.release()
         log.info(f"Synopsis video saved to {output_path} ({len(sorted_times)} frames)")
+        return output_path
+
+    def render_with_schedules(
+        self,
+        tubes: Dict[int, Tube],
+        schedules: Dict[int, Schedule],
+        output_path: str,
+    ) -> str:
+        """Render with full schedules (per-paragraph speed and size).
+
+        For each synopsis frame ``t``, walk every tube whose schedule covers ``t``
+        and look up the source frame via the paragraph's speed-warped time map.
+        Each frame's bbox is shrunk toward its centroid by the paragraph's size
+        factor, then composited onto the background.
+        """
+        h, w = self.bgimg.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(output_path, fourcc, self.fps, (w, h))
+        if not writer.isOpened():
+            raise RuntimeError(f"Cannot open video writer for {output_path}")
+
+        synopsis_end = 0.0
+        for sched in schedules.values():
+            synopsis_end = max(synopsis_end, sched.start + sched.synopsis_duration)
+        if synopsis_end <= 0:
+            log.warning("Empty schedules — writing empty video.")
+            writer.release()
+            return output_path
+
+        n_frames = int(round(synopsis_end * self.fps)) + 1
+        log.info(f"Rendering {n_frames} synopsis frames @ {self.fps} fps")
+
+        # Per-tube cumulative paragraph-start lookup, sorted source-time arrays
+        per_tube_cum = {tid: s.syn_para_cum_starts for tid, s in schedules.items()}
+        per_tube_src_ts = {}
+        for tid, tube in tubes.items():
+            if tid not in schedules:
+                continue
+            ts = tube.timestamps_array
+            if ts.size == 0:
+                continue
+            per_tube_src_ts[tid] = ts - ts.min()
+
+        for frame_i in range(n_frames):
+            t_syn = frame_i / self.fps
+            bg = self.bgimg.copy()
+
+            for tid, sched in schedules.items():
+                if tid not in tubes or tid not in per_tube_src_ts:
+                    continue
+                if t_syn < sched.start or t_syn >= sched.start + sched.synopsis_duration:
+                    continue
+                # Find which paragraph
+                rel = t_syn - sched.start
+                cum = per_tube_cum[tid]
+                durs = sched.syn_para_durs
+                K = sched.num_paragraphs
+                # Linear scan is fine: K is typically 1–10.
+                k = K - 1
+                for kk in range(K):
+                    if rel < cum[kk] + durs[kk]:
+                        k = kk
+                        break
+                t_src = float(sched.src_para_starts[k] + (rel - cum[k]) * sched.speeds[k])
+                size = float(sched.sizes[k])
+
+                # Find nearest source frame
+                src_ts_rel = per_tube_src_ts[tid]
+                idx = int(np.argmin(np.abs(src_ts_rel - t_src)))
+                tf = tubes[tid].frames[idx]
+                bbox = tf.bbox.astype(np.float32)
+                # Shrink bbox toward centroid by ``size``
+                cx = (bbox[0] + bbox[2]) / 2
+                cy = (bbox[1] + bbox[3]) / 2
+                hw = (bbox[2] - bbox[0]) / 2 * size
+                hh = (bbox[3] - bbox[1]) / 2 * size
+                x1 = int(cx - hw); y1 = int(cy - hh)
+                x2 = int(cx + hw); y2 = int(cy + hh)
+                blend_roi_on_background(bg, tf.image, tf.mask, x1, y1, x2, y2)
+
+            writer.write(bg)
+
+        writer.release()
+        log.info(f"Synopsis video saved to {output_path} ({n_frames} frames)")
         return output_path
 
     def render_legacy(
