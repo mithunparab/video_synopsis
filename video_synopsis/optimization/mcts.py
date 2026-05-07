@@ -1,7 +1,17 @@
-"""MCTS+AlphaZero tube optimizer with corrected per-frame 3D collision detection.
+"""GPU-batched MCTS+AlphaZero tube optimizer.
 
-Adapted from the original energy.py but using Tube dataclass and
-compute_pairwise_collision_3d for accurate spatial-temporal collision.
+Rewrites the previous CPU-bound implementation:
+
+  * Slot screening (``_find_earliest_start_time``) and terminal reward use
+    ``TubeBatch`` + ``compute_collision_energy_torch`` / ``compute_energy_torch``
+    instead of per-pair NumPy loops. The TubeBatch is built once at the start
+    of ``optimize`` and reused for every simulation.
+  * NN priors are deferred — newly-expanded leaves are queued and evaluated
+    in batches by a single ``model(...)`` call. Virtual-loss accounting keeps
+    parallel selections from collapsing onto the same path while leaves are
+    waiting for evaluation.
+
+Public surface (``MCTSOptimizer.__init__``, ``optimize``) is unchanged.
 """
 
 import logging
@@ -19,13 +29,19 @@ from tqdm import tqdm
 from video_synopsis.data.types import Tube
 from video_synopsis.optimization.base import BaseOptimizer
 from video_synopsis.optimization.collision import (
+    TubeBatch,
     auto_tune_chronology_M,
-    compute_energy,
-    compute_pairwise_collision_3d,
+    compute_collision_energy_torch,
+    compute_energy_torch,
+    pick_device,
 )
 from video_synopsis.optimization.visualize import save_initial_vs_optimized
 
 log = logging.getLogger(__name__)
+
+# Used to push unplaced tubes outside any plausible synopsis window so the
+# collision kernel's overlap gate evaluates them as non-overlapping.
+_UNPLACED_SENTINEL = 1.0e6
 
 
 class TubeNet(nn.Module):
@@ -53,113 +69,226 @@ class TubeNet(nn.Module):
         return self.policy_head(x), self.value_head(x)
 
 
-class MCTSNode:
-    """MCTS node with AlphaZero-style neural network guidance.
+class _SearchContext:
+    """State shared across every node in a single MCTS search.
 
-    Uses per-frame 3D collision via compute_pairwise_collision_3d.
+    Holds the GPU ``TubeBatch``, the NN, hyperparameters, and helper kernels
+    for slot screening and terminal reward. Centralising this here means each
+    ``MCTSNode`` only needs to carry the (placed_tubes, remaining_tubes) state
+    that actually differs node-to-node.
     """
 
     def __init__(
         self,
-        placed_tubes: Dict[int, float],
-        remaining_tubes: List[int],
         tubes: Dict[int, Tube],
+        batch: TubeBatch,
         total_seconds: float,
-        parent: Optional["MCTSNode"] = None,
-        action_taken: Optional[int] = None,
-        model: Optional[TubeNet] = None,
-        size: Tuple[int, int] = (1920, 1080),
-        device: str = "cpu",
-        collision_method: str = "centroid",
-        sigma: float = 50.0,
-        radius: float = 30.0,
-        w_chronology: float = 0.0,
-        chronology_M: float = 0.0,
-        c_puct: float = 1.4,
-        dirichlet_alpha: float = 0.3,
-        dirichlet_epsilon: float = 0.25,
-        slot_tolerance: float = 0.5,
+        model: Optional[TubeNet],
+        device: torch.device,
+        collision_method: str,
+        sigma: float,
+        radius: float,
+        w_chronology: float,
+        chronology_M: float,
+        c_puct: float,
+        dirichlet_alpha: float,
+        dirichlet_epsilon: float,
+        slot_tolerance: float,
+        slot_sample_count: int = 8,
+        reward_sample_count: int = 32,
+        chunk_size: int = 32,
+        virtual_loss_value: float = 1.0,
     ) -> None:
-        self.placed_tubes = placed_tubes
-        self.remaining_tubes = remaining_tubes
         self.tubes = tubes
-        self.total_seconds = total_seconds
-        self.parent = parent
-        self.children: List["MCTSNode"] = []
-        self.action_taken = action_taken
-        self.visits = 0
-        self.q_value_sum = 0.0
-        self.nn_value = 0.0
+        self.batch = batch
+        self.total_seconds = float(total_seconds)
         self.model = model
         self.device = device
-        self.video_width, self.video_height = size
         self.collision_method = collision_method
-        self.sigma = sigma
-        self.radius = radius
-        self.w_chronology = w_chronology
-        self.chronology_M = chronology_M
-        self.c_puct = c_puct
-        self.slot_tolerance = slot_tolerance
-        self.prior_probs: Dict[int, float] = {}
-        self.untried_actions = self.remaining_tubes.copy()
+        self.sigma = float(sigma)
+        self.radius = float(radius)
+        self.w_chronology = float(w_chronology)
+        self.chronology_M = float(chronology_M)
+        self.c_puct = float(c_puct)
+        self.dirichlet_alpha = float(dirichlet_alpha)
+        self.dirichlet_epsilon = float(dirichlet_epsilon)
+        self.slot_tolerance = float(slot_tolerance)
+        self.slot_sample_count = int(slot_sample_count)
+        self.reward_sample_count = int(reward_sample_count)
+        self.chunk_size = int(chunk_size)
+        self.virtual_loss_value = float(virtual_loss_value)
 
-        if self.model and not self.is_terminal():
-            self._init_nn_priors(dirichlet_alpha, dirichlet_epsilon)
+        # Action space: the network has one output per tube, indexed by tube_id
+        # (matches the previous implementation's convention). We also keep a
+        # sorted-ids vector for state-vector construction.
+        self.sorted_ids: List[int] = sorted(tubes.keys())
+        self.n_actions = len(self.sorted_ids)
+        self.id_to_idx: Dict[int, int] = batch.id_to_idx
+        max_dur = max((t.duration for t in tubes.values()), default=1.0)
+        self.max_dur = max(max_dur, 1e-6)
 
-    def _init_nn_priors(self, dirichlet_alpha: float, dirichlet_epsilon: float) -> None:
+    # ------------------------------------------------------------------ #
+    # Slot screening — single batched torch call per (tube_id, node).
+    # ------------------------------------------------------------------ #
+    def find_earliest_start(self, tube_id: int, placed_tubes: Dict[int, float]) -> float:
+        """Earliest candidate start whose marginal collision is below tolerance.
+
+        Replaces the old per-pair NumPy loop with one ``[B, N]`` torch call.
+        Unplaced tubes are pushed to ``_UNPLACED_SENTINEL`` so the collision
+        kernel's overlap gate ignores them.
+        """
+        duration = self.tubes[tube_id].duration
+        max_start = max(0.0, self.total_seconds - duration)
+
+        if not placed_tubes:
+            return 0.0
+
+        candidates: List[float] = [0.0]
+        for tid, st in placed_tubes.items():
+            c = float(st) + self.tubes[tid].duration
+            if c <= max_start + 1e-6:
+                candidates.append(c)
+        candidates = sorted(set(candidates))
+        if not candidates:
+            candidates = [0.0]
+
+        device = self.device
+        dtype = self.batch.dtype
+        N = self.batch.N
+        B = len(candidates)
+        target_idx = self.id_to_idx[tube_id]
+
+        starts = torch.full((B, N), _UNPLACED_SENTINEL, device=device, dtype=dtype)
+        if placed_tubes:
+            placed_idx = torch.tensor(
+                [self.id_to_idx[t] for t in placed_tubes],
+                device=device, dtype=torch.long,
+            )
+            placed_st = torch.tensor(
+                [float(placed_tubes[t]) for t in placed_tubes],
+                device=device, dtype=dtype,
+            )
+            starts[:, placed_idx] = placed_st  # broadcast across rows
+        starts[:, target_idx] = torch.tensor(candidates, device=device, dtype=dtype)
+
+        # Baseline: same row, but with the target tube also pushed to the
+        # sentinel. Subtracting this isolates the marginal cost of placing
+        # tube_id at each candidate (placed-placed pair contributions cancel).
+        baseline = starts[0:1].clone()
+        baseline[0, target_idx] = _UNPLACED_SENTINEL
+
         with torch.no_grad():
-            state_vec = self._create_input_vector().to(self.device)
-            policy_logits, value_pred = self.model(state_vec)
-            self.nn_value = value_pred.squeeze().item()
-            policy_cpu = policy_logits.squeeze().cpu()
-            all_ids = sorted(self.tubes.keys())
-            n_actions = len(all_ids)
+            e_total = compute_collision_energy_torch(
+                self.batch, starts,
+                method=self.collision_method,
+                sigma=self.sigma, radius=self.radius,
+                sample_count=self.slot_sample_count,
+                chunk_size=self.chunk_size,
+            )
+            e_baseline = compute_collision_energy_torch(
+                self.batch, baseline,
+                method=self.collision_method,
+                sigma=self.sigma, radius=self.radius,
+                sample_count=self.slot_sample_count,
+                chunk_size=self.chunk_size,
+            )
 
-            if policy_cpu.dim() == 0 and n_actions == 1:
-                policy_cpu = policy_cpu.unsqueeze(0)
+        e_per = (e_total - e_baseline).clamp(min=0.0).cpu().numpy()
+        for i, c in enumerate(candidates):
+            if float(e_per[i]) <= self.slot_tolerance:
+                return min(c, max_start)
 
-            mask = torch.full((n_actions,), float("-inf"))
-            valid = [a for a in self.untried_actions if a < n_actions]
+        # Nothing fit cleanly — append at the latest end.
+        latest_end = max(
+            float(st) + self.tubes[tid].duration for tid, st in placed_tubes.items()
+        )
+        return max(0.0, min(latest_end, max_start))
 
-            if valid:
-                mask[valid] = 0.0
-                probs = F.softmax(policy_cpu + mask, dim=-1).numpy()
-            else:
-                probs = np.zeros(n_actions)
+    # ------------------------------------------------------------------ #
+    # Terminal reward — full energy on the GPU, single call.
+    # ------------------------------------------------------------------ #
+    def compute_terminal_energy(self, placed_tubes: Dict[int, float]) -> float:
+        if not placed_tubes:
+            return 0.0
+        device = self.device
+        dtype = self.batch.dtype
+        N = self.batch.N
+        starts = torch.zeros(N, device=device, dtype=dtype)
+        idx = torch.tensor(
+            [self.id_to_idx[t] for t in placed_tubes],
+            device=device, dtype=torch.long,
+        )
+        vals = torch.tensor(
+            [float(placed_tubes[t]) for t in placed_tubes],
+            device=device, dtype=dtype,
+        )
+        starts[idx] = vals
+        with torch.no_grad():
+            e = compute_energy_torch(
+                self.batch, starts,
+                w_duration=1.0, w_collision=10.0, w_activity=10.0,
+                w_chronology=self.w_chronology, chronology_M=self.chronology_M,
+                method=self.collision_method, sigma=self.sigma, radius=self.radius,
+                video_length=self.total_seconds,
+                sample_count=self.reward_sample_count,
+                chunk_size=self.chunk_size,
+            )
+        return float(e.item())
 
-            if self.parent is None and valid and dirichlet_alpha > 0:
-                noise = np.random.dirichlet([dirichlet_alpha] * len(valid))
-                for i, aid in enumerate(valid):
-                    self.prior_probs[aid] = (1 - dirichlet_epsilon) * probs[aid] + dirichlet_epsilon * noise[i]
-            else:
-                for aid in valid:
-                    self.prior_probs[aid] = probs[aid]
 
-            prob_sum = sum(self.prior_probs.values())
-            if prob_sum > 1e-6:
-                for aid in self.prior_probs:
-                    self.prior_probs[aid] /= prob_sum
-            elif valid:
-                uniform = 1.0 / len(valid)
-                for aid in valid:
-                    self.prior_probs[aid] = uniform
+class MCTSNode:
+    """MCTS node with deferred (batched) NN evaluation."""
 
-            self.untried_actions = sorted(self.untried_actions, key=lambda a: -self.prior_probs.get(a, 0.0))
+    def __init__(
+        self,
+        ctx: _SearchContext,
+        placed_tubes: Dict[int, float],
+        remaining_tubes: List[int],
+        parent: Optional["MCTSNode"] = None,
+        action_taken: Optional[int] = None,
+        is_root: bool = False,
+    ) -> None:
+        self.ctx = ctx
+        self.placed_tubes = placed_tubes
+        self.remaining_tubes = remaining_tubes
+        self.parent = parent
+        self.action_taken = action_taken
+        self.children: List["MCTSNode"] = []
+        self.is_root = is_root
+
+        self.visits = 0
+        self.virtual_visits = 0
+        self.q_value_sum = 0.0
+        self.nn_value = 0.0
+
+        # Filled by ``set_priors`` after the batched NN forward pass.
+        self.priors_ready = False
+        self.prior_probs: Dict[int, float] = {}
+        self.untried_actions: List[int] = list(remaining_tubes)
 
     def is_terminal(self) -> bool:
         return not self.remaining_tubes
 
+    def _effective_visits(self) -> int:
+        return self.visits + self.virtual_visits
+
     def get_q_value(self) -> float:
-        return self.q_value_sum / self.visits if self.visits > 0 else 0.0
+        n = self._effective_visits()
+        return self.q_value_sum / n if n > 0 else 0.0
 
     def best_child(self) -> Optional["MCTSNode"]:
         if not self.children:
             return None
-        sqrt_parent = math.sqrt(self.visits)
+        n_total = max(len(self.untried_actions) + len(self.children), 1)
+        default_p = 1.0 / n_total
+        eff_parent = self._effective_visits()
+        sqrt_parent = math.sqrt(eff_parent) if eff_parent > 0 else 1.0
         best_score, best_node = -float("inf"), None
         for child in self.children:
-            prior_p = self.prior_probs.get(child.action_taken, 1e-6)
-            score = child.get_q_value() + self.c_puct * prior_p * (sqrt_parent / (1 + child.visits))
+            p = self.prior_probs.get(child.action_taken, default_p)
+            score = child.get_q_value() + self.ctx.c_puct * p * (
+                sqrt_parent / (1 + child._effective_visits())
+            )
             if score > best_score:
                 best_score, best_node = score, child
         return best_node
@@ -168,198 +297,182 @@ class MCTSNode:
         if not self.untried_actions:
             return None
         action_id = self.untried_actions.pop(0)
-        start_time = self._find_earliest_start_time(action_id)
+        start_time = self.ctx.find_earliest_start(action_id, self.placed_tubes)
         child = MCTSNode(
+            ctx=self.ctx,
             placed_tubes={**self.placed_tubes, action_id: start_time},
             remaining_tubes=[t for t in self.remaining_tubes if t != action_id],
-            tubes=self.tubes,
-            total_seconds=self.total_seconds,
             parent=self,
             action_taken=action_id,
-            model=self.model,
-            size=(self.video_width, self.video_height),
-            device=self.device,
-            collision_method=self.collision_method,
-            sigma=self.sigma,
-            radius=self.radius,
-            w_chronology=self.w_chronology,
-            chronology_M=self.chronology_M,
-            c_puct=self.c_puct,
-            slot_tolerance=self.slot_tolerance,
         )
         self.children.append(child)
         return child
 
-    def _find_earliest_start_time(
-        self, tube_id: int, placements: Optional[Dict[int, float]] = None
-    ) -> float:
-        """Earliest start whose per-frame centroid collision is below tolerance.
-
-        Old behavior used a union-bbox intersection as the gate: if any placed
-        tube's union-bbox touched this tube's union-bbox, the placed tube's
-        whole interval was forbidden. That over-blocked: two pedestrians on
-        the same walkway have overlapping union-bboxes, but at any single
-        moment they're typically far apart on the path.
-
-        New behavior: scan candidate starts (0 and right after each placed
-        tube ends), and for each candidate compute per-frame collision against
-        every placed tube using the same metric the reward uses. Accept the
-        first candidate whose total collision is below ``slot_tolerance``.
-        """
-        current = placements if placements is not None else self.placed_tubes
-        tube = self.tubes[tube_id]
-        duration = tube.duration
-        max_start = max(0.0, self.total_seconds - duration)
-
-        if not current:
-            return 0.0
-
-        candidates: List[float] = [0.0]
-        for tid, st in current.items():
-            candidates.append(st + self.tubes[tid].duration)
-        candidates = sorted(set(c for c in candidates if c <= max_start + 1e-6))
-
-        # Sample every 4th frame for the slot-screening collision call —
-        # cheap enough that we can do this for every (tube, candidate, placed)
-        # triple. The reward function still uses sample_step=1 for the final
-        # objective, so the search is exact at terminal nodes.
-        for cand in candidates:
-            cost = 0.0
-            for tid, st in current.items():
-                cost += compute_pairwise_collision_3d(
-                    tube, cand, self.tubes[tid], st,
-                    method=self.collision_method,
-                    sigma=self.sigma,
-                    radius=self.radius,
-                    sample_step=4,
-                )
-                if cost > self.slot_tolerance:
-                    break
-            if cost <= self.slot_tolerance:
-                return min(cand, max_start)
-
-        # Nothing fits cleanly — append at the latest end.
-        latest_end = max(st + self.tubes[tid].duration for tid, st in current.items())
-        return max(0.0, min(latest_end, max_start))
-
-    def _create_input_vector(self) -> torch.Tensor:
+    def state_vector_cpu(self) -> torch.Tensor:
+        """Build the NN input as a CPU tensor — cheaper to stack later."""
+        ctx = self.ctx
         features: List[float] = []
-        all_ids = sorted(self.tubes.keys())
-        max_dur = max(
-            (self.tubes[tid].duration for tid in all_ids),
-            default=1.0,
-        )
-        if max_dur < 1e-6:
-            max_dur = 1.0
-
-        for tid in all_ids:
+        total = ctx.total_seconds if ctx.total_seconds > 0 else 1.0
+        for tid in ctx.sorted_ids:
             is_placed = 1.0 if tid in self.placed_tubes else 0.0
             start = self.placed_tubes.get(tid, 0.0)
-            norm_start = start / self.total_seconds if self.total_seconds > 0 else 0.0
-            norm_dur = self.tubes[tid].duration / max_dur
+            norm_start = start / total
+            norm_dur = ctx.tubes[tid].duration / ctx.max_dur
             features.extend([is_placed, norm_start, norm_dur])
+        return torch.tensor(features, dtype=torch.float32)
 
-        return torch.tensor(features, dtype=torch.float32, device=self.device)
+    def set_priors(self, policy_logits_cpu: torch.Tensor, value: float) -> None:
+        """Apply NN output to this node. Called from the batched flush."""
+        ctx = self.ctx
+        n_actions = ctx.n_actions
 
-    def compute_reward_metric(self) -> float:
-        """Compute reward using corrected per-frame 3D collision.
+        if policy_logits_cpu.dim() == 0 and n_actions == 1:
+            policy_logits_cpu = policy_logits_cpu.unsqueeze(0)
 
-        Weights match Energy / PSO so all three optimizers minimize the same
-        objective. Default metric is centroid-distance hinge — pairs farther
-        than ``radius`` pixels apart are free, so the optimizer can pack
-        spatially-disjoint tubes in parallel.
-        """
-        if not self.placed_tubes:
-            return 0.0
-        return compute_energy(
-            self.tubes,
-            self.placed_tubes,
-            w_duration=1.0,
-            w_collision=10.0,
-            w_activity=10.0,
-            w_chronology=self.w_chronology,
-            chronology_M=self.chronology_M,
-            method=self.collision_method,
-            sigma=self.sigma,
-            radius=self.radius,
-            video_length=float(self.total_seconds),
-            sample_step=1,
-        )
+        valid = [a for a in self.untried_actions if a < n_actions]
+
+        if valid:
+            mask = torch.full((n_actions,), float("-inf"))
+            mask[valid] = 0.0
+            probs = F.softmax(policy_logits_cpu + mask, dim=-1).numpy()
+        else:
+            probs = np.zeros(n_actions)
+
+        if self.is_root and valid and ctx.dirichlet_alpha > 0:
+            noise = np.random.dirichlet([ctx.dirichlet_alpha] * len(valid))
+            for i, aid in enumerate(valid):
+                self.prior_probs[aid] = (
+                    (1 - ctx.dirichlet_epsilon) * float(probs[aid])
+                    + ctx.dirichlet_epsilon * float(noise[i])
+                )
+        else:
+            for aid in valid:
+                self.prior_probs[aid] = float(probs[aid])
+
+        psum = sum(self.prior_probs.values())
+        if psum > 1e-6:
+            for aid in self.prior_probs:
+                self.prior_probs[aid] /= psum
+        elif valid:
+            uniform = 1.0 / len(valid)
+            for aid in valid:
+                self.prior_probs[aid] = uniform
+
+        # Reorder so the next ``expand()`` tries the highest-prior action first.
+        self.untried_actions.sort(key=lambda a: -self.prior_probs.get(a, 0.0))
+        self.nn_value = float(value)
+        self.priors_ready = True
+
+    # -- Virtual loss for batched leaf evaluation -------------------------- #
+
+    def add_virtual_loss(self) -> None:
+        node: Optional[MCTSNode] = self
+        vl = self.ctx.virtual_loss_value
+        while node is not None:
+            node.virtual_visits += 1
+            node.q_value_sum -= vl
+            node = node.parent
+
+    def remove_virtual_loss(self) -> None:
+        node: Optional[MCTSNode] = self
+        vl = self.ctx.virtual_loss_value
+        while node is not None:
+            node.virtual_visits -= 1
+            node.q_value_sum += vl
+            node = node.parent
 
     def backpropagate(self, value: float) -> None:
-        self.visits += 1
-        self.q_value_sum += value
-        if self.parent:
-            self.parent.backpropagate(value)
+        node: Optional[MCTSNode] = self
+        while node is not None:
+            node.visits += 1
+            node.q_value_sum += value
+            node = node.parent
 
 
-def mcts_search(root: MCTSNode, num_simulations: int) -> MCTSNode:
+def _flush_pending(pending: List[MCTSNode], ctx: _SearchContext) -> None:
+    """Run the queued leaves through the NN in one batched call."""
+    if not pending:
+        return
+    states = torch.stack([n.state_vector_cpu() for n in pending]).to(ctx.device)
+    with torch.no_grad():
+        policy_logits, values = ctx.model(states)
+    policy_cpu = policy_logits.detach().cpu()
+    values_cpu = values.detach().cpu().reshape(-1)
+
+    for node, p, v in zip(pending, policy_cpu, values_cpu):
+        node.remove_virtual_loss()
+        node.set_priors(p, float(v.item()))
+        node.backpropagate(float(v.item()))
+    pending.clear()
+
+
+def mcts_search(
+    root: MCTSNode,
+    num_simulations: int,
+    nn_batch_size: int = 64,
+) -> MCTSNode:
+    """MCTS with batched NN evaluation and virtual-loss-protected parallel descent."""
+    ctx = root.ctx
+    pending: List[MCTSNode] = []
+    has_model = ctx.model is not None
+
+    # Without an NN we can't defer evaluation — fall back to immediate uniform priors.
+    effective_batch = nn_batch_size if has_model else 1
+
     for _ in range(num_simulations):
         node = root
-        while not node.is_terminal():
-            if not node.untried_actions:
-                child = node.best_child()
-                if child is None:
-                    break
-                node = child
-            else:
+        # Selection: walk down via PUCT until we hit a node with untried actions
+        # or a terminal.
+        while not node.is_terminal() and not node.untried_actions:
+            child = node.best_child()
+            if child is None:
                 break
+            node = child
 
-        value = 0.0
-        if not node.is_terminal():
-            if node.untried_actions:
-                expanded = node.expand()
-                if expanded:
-                    node = expanded
-                    value = node.nn_value
-                else:
-                    value = node.nn_value
-            else:
-                value = node.nn_value
-        else:
-            value = -node.compute_reward_metric()
-        node.backpropagate(value)
+        if node.is_terminal():
+            energy = ctx.compute_terminal_energy(node.placed_tubes)
+            node.backpropagate(-energy)
+            continue
+
+        expanded = node.expand()
+        if expanded is None:
+            continue
+
+        if expanded.is_terminal():
+            energy = ctx.compute_terminal_energy(expanded.placed_tubes)
+            expanded.backpropagate(-energy)
+            continue
+
+        if not has_model:
+            # No NN — the leaf has no informed value yet; backprop 0 and move on.
+            # ``best_child`` will fall back to uniform priors.
+            expanded.backpropagate(0.0)
+            continue
+
+        expanded.add_virtual_loss()
+        pending.append(expanded)
+        if len(pending) >= effective_batch:
+            _flush_pending(pending, ctx)
+
+    if pending:
+        _flush_pending(pending, ctx)
     return root
 
 
 def _self_play_episode(
-    model: TubeNet,
-    tubes: Dict[int, Tube],
-    total_seconds: float,
-    device: str,
-    collision_method: str,
-    sigma: float,
-    radius: float,
-    w_chronology: float,
-    chronology_M: float,
+    ctx: _SearchContext,
     mcts_sims: int,
-    video_size: Tuple[int, int],
-    c_puct: float,
-    dirichlet_alpha: float,
-    dirichlet_epsilon: float,
-    slot_tolerance: float,
+    nn_batch_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     root = MCTSNode(
+        ctx=ctx,
         placed_tubes={},
-        remaining_tubes=list(tubes.keys()),
-        tubes=tubes,
-        total_seconds=total_seconds,
-        model=model,
-        device=device,
-        collision_method=collision_method,
-        sigma=sigma,
-        radius=radius,
-        w_chronology=w_chronology,
-        chronology_M=chronology_M,
-        size=video_size,
-        c_puct=c_puct,
-        dirichlet_alpha=dirichlet_alpha,
-        dirichlet_epsilon=dirichlet_epsilon,
-        slot_tolerance=slot_tolerance,
+        remaining_tubes=list(ctx.sorted_ids),
+        is_root=True,
     )
-    mcts_search(root, num_simulations=mcts_sims)
+    mcts_search(root, num_simulations=mcts_sims, nn_batch_size=nn_batch_size)
 
-    num_actions = len(tubes)
+    num_actions = ctx.n_actions
     policy_target = torch.zeros(num_actions, dtype=torch.float32)
 
     if root.children:
@@ -370,7 +483,7 @@ def _self_play_episode(
                     policy_target[child.action_taken] = child.visits / total_visits
 
     value_target = torch.tensor([root.get_q_value()], dtype=torch.float32)
-    return root._create_input_vector().cpu(), policy_target.cpu(), value_target.cpu()
+    return root.state_vector_cpu().cpu(), policy_target.cpu(), value_target.cpu()
 
 
 def _train_model(
@@ -379,7 +492,7 @@ def _train_model(
     training_data: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     epochs: int = 10,
     batch_size: int = 32,
-    device: str = "cpu",
+    device: torch.device = torch.device("cpu"),
 ) -> None:
     if not training_data:
         return
@@ -397,9 +510,11 @@ def _train_model(
     )
 
     model.train()
-    for epoch in range(epochs):
+    for _ in range(epochs):
         for batch_s, batch_p, batch_v in loader:
-            batch_s, batch_p, batch_v = batch_s.to(device), batch_p.to(device), batch_v.to(device)
+            batch_s = batch_s.to(device)
+            batch_p = batch_p.to(device)
+            batch_v = batch_v.to(device)
             optimizer.zero_grad()
             pred_p, pred_v = model(batch_s)
             loss = F.cross_entropy(pred_p, batch_p) + F.mse_loss(pred_v, batch_v)
@@ -409,7 +524,7 @@ def _train_model(
 
 
 class MCTSOptimizer(BaseOptimizer):
-    """MCTS+AlphaZero optimizer with corrected per-frame collision detection."""
+    """MCTS+AlphaZero with TubeBatch-backed slot search and batched NN eval."""
 
     def __init__(
         self,
@@ -431,6 +546,11 @@ class MCTSOptimizer(BaseOptimizer):
         dirichlet_epsilon: float = 0.25,
         output_dir: str = "optimized_tubes_mcts",
         fps: float = 30.0,
+        nn_batch_size: int = 64,
+        slot_sample_count: int = 8,
+        reward_sample_count: int = 32,
+        chunk_size: int = 32,
+        device: str = "",
     ):
         self.video_size = video_size
         self.num_training_episodes = num_training_episodes
@@ -450,25 +570,23 @@ class MCTSOptimizer(BaseOptimizer):
         self.dirichlet_epsilon = dirichlet_epsilon
         self.output_dir = output_dir
         self.fps = float(fps)
+        self.nn_batch_size = int(nn_batch_size)
+        self.slot_sample_count = int(slot_sample_count)
+        self.reward_sample_count = int(reward_sample_count)
+        self.chunk_size = int(chunk_size)
+        self.device_pref = device
 
     def optimize(self, tubes: Dict[int, Tube], video_length_frames: int) -> Dict[int, float]:
         if not tubes:
             return {}
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = pick_device(self.device_pref or None)
         log.info(f"MCTS optimizer using device: {device}")
 
-        # Convert frames -> seconds. tube.duration is in seconds, so MCTS needs
-        # to operate in seconds throughout (was mixing units before).
         total_seconds = float(video_length_frames) / max(self.fps, 1e-6)
-        # Tighten the search horizon so MCTS doesn't try to schedule across the
-        # full augmented timeline (which produces multi-thousand-second
-        # synopses). target_duration ~= 3x max tube duration matches Energy.
         max_tube_dur = max((t.duration for t in tubes.values()), default=1.0)
         n = len(tubes)
         target_duration = max_tube_dur * min(3.0, max(1.5, n / 10.0))
-        # Use the larger of target_duration and total_seconds as the hard
-        # ceiling so the scheduler has slack if collisions force expansion.
         search_horizon = max(target_duration, total_seconds)
         log.info(
             f"MCTS horizon: target={target_duration:.1f}s, "
@@ -479,31 +597,72 @@ class MCTSOptimizer(BaseOptimizer):
         if self.w_chronology > 0:
             log.info(f"Chronology weight: {self.w_chronology:.3f}, auto-tuned M: {chronology_M:.1f}s")
 
+        # Single GPU upload of all tubes — reused for every simulation.
+        batch = TubeBatch(tubes, device=device)
+
         num_tubes = len(tubes)
         nn_input = num_tubes * 3
         model = TubeNet(nn_input, num_actions=num_tubes).to(device)
         opt = torch.optim.Adam(model.parameters(), lr=self.lr)
 
-        # Self-play training
+        def _make_ctx(model_for_search: Optional[TubeNet]) -> _SearchContext:
+            return _SearchContext(
+                tubes=tubes,
+                batch=batch,
+                total_seconds=search_horizon,
+                model=model_for_search,
+                device=device,
+                collision_method=self.collision_method,
+                sigma=self.sigma,
+                radius=self.radius,
+                w_chronology=self.w_chronology,
+                chronology_M=chronology_M,
+                c_puct=self.c_puct,
+                dirichlet_alpha=self.dirichlet_alpha,
+                dirichlet_epsilon=self.dirichlet_epsilon,
+                slot_tolerance=self.slot_tolerance,
+                slot_sample_count=self.slot_sample_count,
+                reward_sample_count=self.reward_sample_count,
+                chunk_size=self.chunk_size,
+            )
+
+        # ----------------------------- Self-play training ---------------- #
         all_data: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for episode in range(self.num_training_episodes):
             log.info(f"Self-play episode {episode+1}/{self.num_training_episodes}")
             model.eval()
+            ctx = _make_ctx(model)
             for _ in tqdm(range(self.games_per_episode), desc=f"Games Ep.{episode+1}"):
                 data = _self_play_episode(
-                    model, tubes, search_horizon, device,
-                    self.collision_method, self.sigma, self.radius,
-                    self.w_chronology, chronology_M,
-                    self.mcts_sims_training, self.video_size,
-                    self.c_puct, self.dirichlet_alpha, self.dirichlet_epsilon,
-                    self.slot_tolerance,
+                    ctx, self.mcts_sims_training, self.nn_batch_size,
                 )
                 all_data.append(data)
             _train_model(model, opt, all_data, self.training_epochs, self.batch_size, device)
 
-        # Final optimization
+        # ----------------------------- Final placement ------------------- #
         log.info("Running final MCTS optimization...")
         model.eval()
+        # Final search uses a no-Dirichlet context (deterministic at root).
+        final_ctx = _SearchContext(
+            tubes=tubes,
+            batch=batch,
+            total_seconds=search_horizon,
+            model=model,
+            device=device,
+            collision_method=self.collision_method,
+            sigma=self.sigma,
+            radius=self.radius,
+            w_chronology=self.w_chronology,
+            chronology_M=chronology_M,
+            c_puct=self.c_puct,
+            dirichlet_alpha=0.0,
+            dirichlet_epsilon=0.0,
+            slot_tolerance=self.slot_tolerance,
+            slot_sample_count=self.slot_sample_count,
+            reward_sample_count=self.reward_sample_count,
+            chunk_size=self.chunk_size,
+        )
+
         placements: Dict[int, float] = {}
         remaining = list(tubes.keys())
 
@@ -512,24 +671,12 @@ class MCTSOptimizer(BaseOptimizer):
             if not remaining:
                 break
             root = MCTSNode(
+                ctx=final_ctx,
                 placed_tubes=placements.copy(),
                 remaining_tubes=remaining.copy(),
-                tubes=tubes,
-                total_seconds=search_horizon,
-                model=model,
-                device=device,
-                collision_method=self.collision_method,
-                sigma=self.sigma,
-                radius=self.radius,
-                w_chronology=self.w_chronology,
-                chronology_M=chronology_M,
-                size=self.video_size,
-                c_puct=self.c_puct,
-                dirichlet_alpha=0.0,
-                dirichlet_epsilon=0.0,
-                slot_tolerance=self.slot_tolerance,
+                is_root=True,
             )
-            mcts_search(root, num_simulations=self.mcts_sims_final)
+            mcts_search(root, num_simulations=self.mcts_sims_final, nn_batch_size=self.nn_batch_size)
 
             if not root.children:
                 log.warning("No children from MCTS, stopping.")
@@ -541,31 +688,16 @@ class MCTSOptimizer(BaseOptimizer):
             remaining.remove(action)
             pbar.set_postfix({"tid": action, "t": f"{placements[action]:.1f}s"})
 
-        # Handle unplaced tubes
+        # Heuristic fallback for anything MCTS didn't place.
         if remaining:
             log.warning(f"{len(remaining)} tubes unplaced, using heuristic.")
-            temp = MCTSNode(
-                placed_tubes=placements.copy(),
-                remaining_tubes=remaining.copy(),
-                tubes=tubes,
-                total_seconds=search_horizon,
-                model=None,
-                device="cpu",
-                collision_method=self.collision_method,
-                sigma=self.sigma,
-                radius=self.radius,
-                w_chronology=self.w_chronology,
-                chronology_M=chronology_M,
-                slot_tolerance=self.slot_tolerance,
-            )
+            heuristic_ctx = _make_ctx(None)
             for tid in remaining:
-                start = temp._find_earliest_start_time(tid, placements)
-                placements[tid] = start
+                placements[tid] = heuristic_ctx.find_earliest_start(tid, placements)
 
         log.info(f"MCTS optimization complete. {len(placements)} placements.")
 
         self._plot_results(tubes, placements, video_length_frames)
-
         return placements
 
     def _plot_results(
